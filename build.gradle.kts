@@ -8,8 +8,11 @@ group = "com.ecommerce"
 version = "0.0.1-SNAPSHOT"
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    // Toolchain (not sourceCompatibility) so Gradle resolves or provisions a JDK 21
+    // on any machine, instead of depending on whatever JVM happens to be on PATH.
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 repositories {
