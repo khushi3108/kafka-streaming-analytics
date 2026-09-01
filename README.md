@@ -80,7 +80,7 @@ curl -X POST "http://localhost:8090/api/orders/simulate?count=30"
 | Kafka UI | http://localhost:9090 | Browse topics, messages, consumer lag |
 | ksqlDB Server | http://localhost:8088 | Streaming SQL REST API |
 | Schema Registry | http://localhost:8081 | Avro schema management |
-| Kafka Broker | localhost:9092 | Direct Kafka client access |
+| Kafka Brokers | localhost:9092, :9093, :9094 | 3-broker cluster (RF=3, min.insync.replicas=2) |
 
 ---
 

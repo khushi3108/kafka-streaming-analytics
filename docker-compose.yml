@@ -1,8 +1,27 @@
 # =====================================================================
 #  E-Commerce Kafka Streaming Stack
-#  Boot order: zookeeper → kafka → kafka-setup → schema-registry
+#  Boot order: zookeeper → kafka-1/kafka-2/kafka-3 → kafka-setup
+#                                              → schema-registry
 #                                              → ksqldb-server → ksqldb-cli
 #                                              → kafka-ui
+#
+#  DURABILITY (why three brokers):
+#    The Streams application runs EXACTLY_ONCE_V2 (see KafkaStreamsConfig.java). Exactly-once
+#    is implemented with Kafka transactions, whose state lives in the internal
+#    __transaction_state topic. On the previous single-broker setup that topic had
+#    replication-factor 1, so losing the one broker lost the transaction log — the guarantee
+#    would have been a demo, not a guarantee. Three brokers with RF=3 and
+#    min.insync.replicas=2 means every committed transaction, offset and application record
+#    survives the loss of any single broker, and writes are refused (rather than silently
+#    under-replicated) if two are down.
+#
+#  MEMORY: sized for a 16 GB machine. Each broker is capped at 512 MB heap and ksqlDB at
+#    768 MB, so the whole stack (3 brokers + ZK + SR + ksqlDB + UI) fits comfortably
+#    alongside the Spring Boot app and an IDE. Do not remove KAFKA_HEAP_OPTS — the Confluent
+#    image otherwise defaults to a 1 GB heap per broker.
+#
+#  PORTS: brokers are reachable from the host at localhost:9092, :9093, :9094 and from
+#    inside the compose network at kafka-1:29092, kafka-2:29093, kafka-3:29094.
 # =====================================================================
 
 services:
@@ -17,17 +36,18 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx256m"
     healthcheck:
       test: echo stat | nc localhost 2181
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # ─── Kafka Broker ─────────────────────────────────────────────────
-  kafka:
+  # ─── Kafka Broker 1 ───────────────────────────────────────────────
+  kafka-1:
     image: confluentinc/cp-kafka:7.5.0
-    hostname: kafka
-    container_name: kafka
+    hostname: kafka-1
+    container_name: kafka-1
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -37,27 +57,108 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka-1:29092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # ── Durability: replicate everything three ways, require 2 acks ──
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      # __transaction_state backs EXACTLY_ONCE_V2. RF=3/minISR=2 so a broker loss cannot
+      # take the transaction log — and with it the exactly-once guarantee — down with it.
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_LOG_RETENTION_HOURS: 2
+      # 7 days (was 2 hours). Two hours makes replay and reprocessing impossible: any
+      # investigation, backfill or "re-run the topology after a bug fix" needs the source
+      # records to still exist. 168h is the Kafka default for a reason.
+      KAFKA_LOG_RETENTION_HOURS: 168
       # true so ksqlDB can auto-create its own internal/output topics
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
     healthcheck:
       test: kafka-topics --bootstrap-server localhost:9092 --list
       interval: 10s
       timeout: 10s
-      retries: 10
+      retries: 15
+
+  # ─── Kafka Broker 2 ───────────────────────────────────────────────
+  kafka-2:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka-2
+    container_name: kafka-2
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9093,PLAINTEXT_INTERNAL://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9093,PLAINTEXT_INTERNAL://kafka-2:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: kafka-topics --bootstrap-server localhost:9093 --list
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ─── Kafka Broker 3 ───────────────────────────────────────────────
+  kafka-3:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka-3
+    container_name: kafka-3
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 3
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9094,PLAINTEXT_INTERNAL://0.0.0.0:29094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9094,PLAINTEXT_INTERNAL://kafka-3:29094
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: kafka-topics --bootstrap-server localhost:9094 --list
+      interval: 10s
+      timeout: 10s
+      retries: 15
 
   # ─── Topic bootstrap (one-shot: creates all application topics) ───
   kafka-setup:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka-setup
     depends_on:
-      kafka:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
     volumes:
       - ./docker/kafka-init.sh:/kafka-init.sh:ro
@@ -76,8 +177,11 @@ services:
       - "8081:8081"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
-      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # _schemas is Schema Registry's own source of truth — replicate it like everything else.
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 3
+      SCHEMA_REGISTRY_HEAP_OPTS: "-Xms256m -Xmx512m"
     healthcheck:
       test: curl -sf http://localhost:8081/ || exit 1
       interval: 15s
@@ -97,15 +201,21 @@ services:
     ports:
       - "8088:8088"
     environment:
-      KSQL_BOOTSTRAP_SERVERS: kafka:29092
+      KSQL_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
       KSQL_HOST_NAME: ksqldb-server
       KSQL_LISTENERS: http://0.0.0.0:8088
       KSQL_CACHE_MAX_BYTES_BUFFERING: 0
       KSQL_KSQL_SCHEMA_REGISTRY_URL: http://schema-registry:8081
-      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: 1
+      # ksqlDB creates command/internal/changelog topics of its own. They must be replicated
+      # to RF=3 too, otherwise the broker-level min.insync.replicas=2 rejects writes to them.
+      KSQL_KSQL_INTERNAL_TOPIC_REPLICAS: 3
+      KSQL_KSQL_STREAMS_REPLICATION_FACTOR: 3
+      KSQL_KSQL_STREAMS_TOPIC_MIN_INSYNC_REPLICAS: 2
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: 3
       KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true"
       KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
       KSQL_KSQL_STREAMS_AUTO_OFFSET_RESET: earliest
+      KSQL_HEAP_OPTS: "-Xms512m -Xmx768m"
     healthcheck:
       test: curl -sf http://localhost:8088/info || exit 1
       interval: 15s
@@ -148,7 +258,7 @@ services:
       - "9090:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local-cluster
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
       KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
       KAFKA_CLUSTERS_0_KSQLDBSERVER: http://ksqldb-server:8088
-
+      JAVA_OPTS: "-Xms128m -Xmx384m"

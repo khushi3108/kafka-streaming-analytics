@@ -78,13 +78,21 @@ The project uses Spring Boot as the REST-API and producer layer, with Docker Com
 | `enriched-orders` | Regular | orderId | EnrichedOrder JSON | Kafka Streams topology |
 | `fraud-alerts` | Regular | orderId | OrderAlert JSON | Kafka Streams topology |
 | `category-sales` | Regular | category | CategorySales JSON | Kafka Streams topology |
+| `dead-letter` | Regular | original key bytes | original value bytes + failure headers | Kafka Streams deserialization handler |
 
 **Compacted topic** (`products`): Kafka retains only the latest message per key. This makes it suitable as a KTable source — Kafka Streams reads the full changelog to reconstruct the latest product catalog in local state.
 
+All application topics are created with **replication factor 3 and `min.insync.replicas=2`** against the three-broker cluster in `docker-compose.yml`.
+
 ### 3.3 Stream Processing Guarantees
 
-- **Exactly-once semantics**: Kafka Streams uses idempotent producers + atomic offset commits to ensure each record is processed exactly once even on restart
-- **Fault tolerance**: State stores (RocksDB) are backed by internal changelog Kafka topics. On restart, Kafka Streams rebuilds state from the changelog
+- **Exactly-once semantics (`EXACTLY_ONCE_V2`)**: `StreamsConfig.PROCESSING_GUARANTEE_CONFIG` is set to `EXACTLY_ONCE_V2` in `KafkaStreamsConfig.java`. Each commit is a single Kafka transaction that atomically covers the records written to output topics, the writes to state-store changelog topics, **and** the input consumer offsets — so a crash cannot leave "output produced but offsets uncommitted", and a redelivered record cannot be counted twice. The producer settings that back it (`enable.idempotence=true`, `acks=all`, `max.in.flight.requests.per.connection=5`, `transaction.timeout.ms=60000`) are set explicitly, and consumers read at `isolation.level=read_committed`. `commit.interval.ms` is 100 ms: under EOS the commit interval is the transaction size, and downstream `read_committed` consumers see nothing until a transaction commits, so it is also the end-to-end latency floor.
+  - **Why this matters here**: before this was enabled the app ran at `at_least_once`. The windowed `category-sales` aggregate eventually aged duplicates out, but the *unwindowed* `customer-spending-store` has no window to expire them, so every crash-and-restart left permanent, compounding drift in customer totals.
+- **Durability underneath the guarantee**: exactly-once is implemented with Kafka transactions, whose state lives in the internal `__transaction_state` topic. `docker-compose.yml` runs **three brokers**, with RF=3 / `min.insync.replicas=2` for `__transaction_state`, `__consumer_offsets`, all application topics and all Streams internal (changelog/repartition) topics. On the earlier single-broker, RF=1 setup, exactly-once would have *started* but losing the one broker would have lost the transaction log — a demo, not a guarantee. Log retention is 168 h (7 days), up from 2 h, so replay and reprocessing are actually possible.
+- **Deterministic, dedupable alerts**: `OrderAlert.fromEnrichedOrder` derives `alertId` as a name-based UUID over (orderId, alertType, severity) and uses the **order's event time** as `timestamp`. Replaying the same order therefore produces a byte-identical alert. Previously these were `UUID.randomUUID()` and `System.currentTimeMillis()`, so a redelivered order emitted a second, indistinguishable-but-different alert — ksqlDB's `fraud_by_category COUNT(*)` double-counted it and a real on-call rotation would be paged twice for one incident.
+- **Dead-letter handling, with an honest caveat**: `DeadLetterDeserializationExceptionHandler` writes a poison-pill record's raw key/value bytes plus failure metadata (source topic, partition, offset, source timestamp, exception class and message) to the `dead-letter` topic and then returns `CONTINUE`. This replaces `LogAndContinueExceptionHandler`, which discarded the bytes entirely.
+  - **Caveat — the DLQ write is NOT exactly-once.** Kafka Streams does not expose the task's transactional producer to a `DeserializationExceptionHandler`, and a record that fails to deserialize is precisely the record whose processing transaction is about to be abandoned. The handler therefore uses a separate, non-transactional producer (idempotent and `acks=all`, but outside the Streams transaction). A crash between the DLQ write and the offset commit re-delivers the record on restart and writes it to the DLQ **a second time**. DLQ consumers must dedupe on the `dlq.original.topic` / `dlq.original.partition` / `dlq.original.offset` headers. The DLQ is at-least-once; only the main processing path is exactly-once.
+- **Fault tolerance**: State stores (RocksDB) are backed by internal changelog Kafka topics, now RF=3 / minISR=2. On restart, Kafka Streams rebuilds state from the changelog
 - **Ordered processing**: Within a partition, records maintain Kafka's ordering guarantee
 - **Event time**: Window aggregations use the `timestamp` field embedded in the JSON payload (event time), not wall-clock time, so late arrivals are placed in the correct window
 
@@ -369,26 +377,26 @@ curl -X POST http://localhost:8088/query \
 
 ```bash
 # List topics
-docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --list
 
 # Watch the orders topic in real time
-docker exec -it kafka kafka-console-consumer \
+docker exec -it kafka-1 kafka-console-consumer \
   --bootstrap-server localhost:9092 \
   --topic orders --from-beginning \
   --property print.key=true
 
 # Watch fraud alerts as they are generated
-docker exec -it kafka kafka-console-consumer \
+docker exec -it kafka-1 kafka-console-consumer \
   --bootstrap-server localhost:9092 \
   --topic fraud-alerts --from-beginning
 
 # Check consumer group lag for the Streams app
-docker exec kafka kafka-consumer-groups \
+docker exec kafka-1 kafka-consumer-groups \
   --bootstrap-server localhost:9092 \
   --describe --group ecommerce-streams-app
 
 # Manually produce a test order
-docker exec -it kafka kafka-console-producer \
+docker exec -it kafka-1 kafka-console-producer \
   --bootstrap-server localhost:9092 \
   --topic orders --property parse.key=true --property key.separator="|"
 # Then type: ord-001|{"orderId":"ord-001","customerId":"C001","productId":"P001","category":"Electronics","amount":999.99,"quantity":1,"status":"PENDING","timestamp":1712600000000}

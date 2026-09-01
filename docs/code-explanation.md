@@ -42,7 +42,7 @@ controller/
 ```yaml
 spring:
   kafka:
-    bootstrap-servers: localhost:9092   # all Kafka clients connect here
+    bootstrap-servers: localhost:9092,localhost:9093,localhost:9094   # 3-broker cluster
 
     producer:
       key-serializer:   StringSerializer  # orderId as String key
@@ -53,7 +53,7 @@ spring:
 
     streams:
       application-id: ecommerce-streams-app   # consumer group prefix + state dir name
-      bootstrap-servers: localhost:9092
+      bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
       # ⚠ ALL other StreamsConfig is set in KafkaStreamsConfig.java to avoid
       # duplicate/conflicting configuration between YAML and Java bean.
 

@@ -17,13 +17,39 @@ spring:
       use-big-decimal-for-floats: true
 
   kafka:
-    # Single source of truth for broker address
-    bootstrap-servers: localhost:9092
+    # Single source of truth for broker addresses.
+    # Three brokers (docker-compose.yml) — listing all of them means the client can still
+    # bootstrap when any one is down. A single entry here would make the whole replicated
+    # cluster unreachable the moment that one broker restarted.
+    bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
 
     # ── Producer ──────────────────────────────────────────────────────
+    # This is the KafkaTemplate producer used by OrderProducer / ProductProducer for the
+    # ingress side (REST + simulator). It is NOT the Kafka Streams producer — that one is
+    # configured in KafkaStreamsConfig.java and runs under EXACTLY_ONCE_V2.
+    #
+    # Exactly-once inside the topology is worthless if the records entering `orders` are
+    # already duplicated or already lost, so the ingress producer gets the same two
+    # durability settings that back EOS:
+    #   acks=all            → the leader waits for min.insync.replicas (2 of 3) before
+    #                         acknowledging, so an acked order survives a broker loss.
+    #   enable.idempotence  → the broker de-duplicates producer retries via (PID, epoch, seq).
+    #                         Without it, a retry after a network timeout silently writes the
+    #                         same order twice — a duplicate the topology would then faithfully
+    #                         process exactly once, each.
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        # <= 5 is required for idempotence to preserve per-partition ordering.
+        max.in.flight.requests.per.connection: 5
+        # This producer is not transactional today (no transaction-id-prefix is set, so
+        # KafkaTemplate does not open transactions). The value is set to match the Streams
+        # producer so that turning on transactional sends later does not silently inherit
+        # the tight 60s-vs-10s mismatch. Must stay <= the broker's transaction.max.timeout.ms.
+        transaction.timeout.ms: 60000
 
     # ── Admin ─────────────────────────────────────────────────────────
     # fail-fast=false: don't crash on startup if Kafka is briefly unavailable
@@ -36,7 +62,7 @@ spring:
     # to avoid duplicate/conflicting config.
     streams:
       application-id: ecommerce-streams-app
-      bootstrap-servers: localhost:9092
+      bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
 
 # ── Application config ────────────────────────────────────────────────
 app:
@@ -46,6 +72,8 @@ app:
     enriched-orders: enriched-orders
     fraud-alerts: fraud-alerts
     category-sales: category-sales
+    # Records that failed deserialization, written by DeadLetterDeserializationExceptionHandler.
+    dead-letter: dead-letter
   fraud:
     threshold: 500.0
 

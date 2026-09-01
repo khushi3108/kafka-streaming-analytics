@@ -58,26 +58,27 @@ ksqldb-cli        Up
 kafka-ui          Up
 ```
 
-> **Assignment connection:** `kafka-setup` automatically created all 5 Kafka topics (orders, products, enriched-orders, fraud-alerts, category-sales). `ksqldb-setup` automatically ran `ksql/init.sql` which created all ksqlDB STREAMs and TABLEs. No manual setup needed.
+> **Assignment connection:** `kafka-setup` automatically created all 6 Kafka topics (orders, products, enriched-orders, fraud-alerts, category-sales, dead-letter), each with replication factor 3 and `min.insync.replicas=2` across the three brokers. `ksqldb-setup` automatically ran `ksql/init.sql` which created all ksqlDB STREAMs and TABLEs. No manual setup needed.
 
 ---
 
 ## STEP 2 — Verify the Topics Were Created
 
 ```bash
-docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --list
 ```
 
 ✅ **You should see:**
 ```
 category-sales
+dead-letter
 enriched-orders
 fraud-alerts
 orders
 products
 ```
 
-> **Assignment connection:** These 5 topics are the backbone of the streaming pipeline. `orders` is where events enter. The other 4 are outputs written by the Kafka Streams topology (the Java code). This proves the infrastructure is wired correctly.
+> **Assignment connection:** These 6 topics are the backbone of the streaming pipeline. `orders` is where events enter. `enriched-orders`, `fraud-alerts` and `category-sales` are outputs written by the Kafka Streams topology (the Java code). `dead-letter` receives records that failed deserialization, with their raw bytes and failure metadata, instead of dropping them. This proves the infrastructure is wired correctly.
 
 ---
 
