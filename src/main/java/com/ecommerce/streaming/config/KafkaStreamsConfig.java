@@ -53,8 +53,19 @@ public class KafkaStreamsConfig {
 
         // ─── Performance & Reliability ────────────────────────────
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000);      // commit offsets every 1s
-        props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 0);  // disable record cache (for demo – see results immediately)
+
+        // Record cache: 10 MB. Previously 0, which forced Kafka Streams to forward a
+        // downstream update for EVERY input record – a 100-order window produced 100
+        // messages on `category-sales` instead of one. Combined with the suppress()
+        // operator in OrderStreamTopology, each window now emits exactly one final result.
+        props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 10 * 1024 * 1024);
         props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 2);
+
+        // ─── Event time ───────────────────────────────────────────
+        // Use the payload's `timestamp` field, not the broker append time, so the Java
+        // topology windows on the same clock as ksqlDB (TIMESTAMP='timestamp' in init.sql).
+        props.put(StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG,
+                OrderTimestampExtractor.class);
 
         // ─── Consumer settings ────────────────────────────────────
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"); // process from beginning

@@ -5,6 +5,17 @@ spring:
   application:
     name: ecommerce-kafka-streaming
 
+  # ── Jackson (shared ObjectMapper used by OrderProducer / ProductProducer) ──
+  # Money is BigDecimal. These two settings keep the REST + producer JSON identical
+  # to what the Kafka Streams JsonSerde emits/reads:
+  #   write-bigdecimal-as-plain  → 2499.99, never 2.49999E+3 (ksqlDB reads these as DOUBLE)
+  #   use-big-decimal-for-floats → inbound JSON floats bind as BigDecimal, not lossy double
+  jackson:
+    generator:
+      write-bigdecimal-as-plain: true
+    deserialization:
+      use-big-decimal-for-floats: true
+
   kafka:
     # Single source of truth for broker address
     bootstrap-servers: localhost:9092

@@ -6,6 +6,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.math.BigDecimal;
+
 /**
  * Result of joining an Order with its Product details.
  * Published to the "enriched-orders" Kafka topic by the Kafka Streams topology.
@@ -23,7 +25,8 @@ public class EnrichedOrder {
     private String productName;
     private String brand;
     private String category;
-    private double amount;
+    /** Order amount in USD – BigDecimal to keep money exact. */
+    private BigDecimal amount;
     private int quantity;
     private String status;
     private long timestamp;

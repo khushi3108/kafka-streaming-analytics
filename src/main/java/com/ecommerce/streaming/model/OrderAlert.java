@@ -6,6 +6,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.math.BigDecimal;
 import java.util.UUID;
 
 /**
@@ -25,7 +26,8 @@ public class OrderAlert {
     private String productId;
     private String productName;
     private String category;
-    private double amount;
+    /** Order amount in USD – BigDecimal to stay consistent with Order/EnrichedOrder. */
+    private BigDecimal amount;
     private int quantity;
 
     /**
@@ -41,11 +43,16 @@ public class OrderAlert {
     private String severity;
     private long timestamp;
 
+    private static final BigDecimal SEVERITY_CRITICAL = new BigDecimal("2000");
+    private static final BigDecimal SEVERITY_HIGH     = new BigDecimal("1000");
+
     /** Build an alert from an EnrichedOrder */
     public static OrderAlert fromEnrichedOrder(EnrichedOrder order, String alertType) {
+        BigDecimal amount = order.getAmount() != null ? order.getAmount() : BigDecimal.ZERO;
+
         String severity;
-        if (order.getAmount() > 2000) severity = "CRITICAL";
-        else if (order.getAmount() > 1000) severity = "HIGH";
+        if (amount.compareTo(SEVERITY_CRITICAL) > 0) severity = "CRITICAL";
+        else if (amount.compareTo(SEVERITY_HIGH) > 0) severity = "HIGH";
         else severity = "MEDIUM";
 
         return OrderAlert.builder()
@@ -55,7 +62,7 @@ public class OrderAlert {
                 .productId(order.getProductId())
                 .productName(order.getProductName())
                 .category(order.getCategory())
-                .amount(order.getAmount())
+                .amount(amount)
                 .quantity(order.getQuantity())
                 .alertType(alertType)
                 .severity(severity)

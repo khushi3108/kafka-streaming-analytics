@@ -1,5 +1,6 @@
 package com.ecommerce.streaming.serde;
 
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -24,9 +25,24 @@ import java.io.IOException;
  */
 public class JsonSerde<T> implements Serde<T> {
 
+    /**
+     * Shared mapper.
+     *
+     * <p>Money is modelled as {@link java.math.BigDecimal}, so two Jackson settings matter:
+     * <ul>
+     *   <li>{@code USE_BIG_DECIMAL_FOR_FLOATS} – any JSON floating-point value is read as a
+     *       BigDecimal rather than a lossy double. Typed fields already bind correctly, but
+     *       this also protects untyped/Map or JsonNode paths from silently losing precision.</li>
+     *   <li>{@code WRITE_BIGDECIMAL_AS_PLAIN} – emit {@code 2499.99}, never {@code 2.49999E+3}.
+     *       ksqlDB reads these topics as {@code DOUBLE}; scientific notation is a parsing risk
+     *       and makes the payloads unreadable in kafka-console-consumer.</li>
+     * </ul>
+     */
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .registerModule(new JavaTimeModule())
-            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+            .configure(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS, true)
+            .configure(JsonGenerator.Feature.WRITE_BIGDECIMAL_AS_PLAIN, true);
 
     private final Class<T> targetType;
 

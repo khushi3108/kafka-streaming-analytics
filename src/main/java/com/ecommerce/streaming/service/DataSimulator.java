@@ -7,6 +7,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
@@ -102,19 +104,23 @@ public class DataSimulator {
         String customerId = CUSTOMER_IDS.get(RANDOM.nextInt(CUSTOMER_IDS.size()));
 
         // Occasionally inject a high-value order (~15% chance) to trigger fraud alerts
-        double amount;
+        BigDecimal amount;
         int quantity;
         if (RANDOM.nextDouble() < 0.15) {
             // High-value order: multiply by 2-5
             quantity = RANDOM.nextInt(3) + 2;
-            amount = product.getPrice() * quantity * (1.0 + RANDOM.nextDouble());
+            BigDecimal surgeMultiplier = BigDecimal.valueOf(1.0 + RANDOM.nextDouble());
+            amount = product.getPrice()
+                    .multiply(BigDecimal.valueOf(quantity))
+                    .multiply(surgeMultiplier);
         } else {
             quantity = RANDOM.nextInt(3) + 1;
-            amount = product.getPrice() * quantity;
+            amount = product.getPrice().multiply(BigDecimal.valueOf(quantity));
         }
 
-        // Round to 2 decimal places
-        amount = Math.round(amount * 100.0) / 100.0;
+        // Normalise to cents – BigDecimal, so the value published is exactly what
+        // downstream aggregation will sum (no binary-float surprises).
+        amount = amount.setScale(2, RoundingMode.HALF_UP);
 
         return Order.builder()
                 .orderId(UUID.randomUUID().toString())

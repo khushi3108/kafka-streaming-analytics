@@ -13,6 +13,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 
 /**
@@ -31,9 +32,10 @@ import java.time.Duration;
  *  2. LEFT JOIN orders ← products  →  EnrichedOrder
  *  3. Re-key enriched orders by orderId
  *  4. BRANCH A: filter amount > threshold  →  fraud-alerts
- *  5. BRANCH B: group by category + tumbling window 1 min
+ *  5. BRANCH B: group by category + tumbling window 1 min (+30s grace),
+ *               suppressed until the window closes
  *               aggregate(count, sum, avg)  →  category-sales-store
- *  6. BRANCH C: group by customerId + session window 5 min
+ *  6. BRANCH C: group by customerId, UNBOUNDED running aggregate
  *               aggregate(total spent)      →  customer-spending-store
  *
  *  Kafka Topics (OUTPUT):
@@ -62,12 +64,24 @@ public class OrderStreamTopology {
     private String categorySalesTopic;
 
     @Value("${app.fraud.threshold:500.0}")
-    private double fraudThreshold;
+    private BigDecimal fraudThreshold;
 
     // ── State store names (used by AnalyticsController for IQ) ──────────
     public static final String CATEGORY_SALES_STORE   = "category-sales-store";
     public static final String CUSTOMER_SPENDING_STORE = "customer-spending-store";
     public static final String PRODUCTS_STORE          = "products-store";
+
+    // ── Windowing ───────────────────────────────────────────────────────
+    /** Tumbling window size for the per-category sales aggregation. */
+    private static final Duration WINDOW_SIZE  = Duration.ofMinutes(1);
+    /**
+     * How long after a window's end we still accept records that belong to it.
+     * With zero grace, any order whose EVENT time landed in an already-closed window
+     * was dropped from the aggregate – yet the same record still reached
+     * `enriched-orders`, still raised a fraud alert and still incremented customer
+     * spending, leaving the three outputs mutually inconsistent.
+     */
+    private static final Duration WINDOW_GRACE = Duration.ofSeconds(30);
 
     /**
      * Spring Kafka calls this method automatically because it is annotated with
@@ -145,7 +159,9 @@ public class OrderStreamTopology {
         //           threshold (default $500) and publish to fraud-alerts.
         // ════════════════════════════════════════════════════════════════
         enrichedStream
-                .filter((orderId, order) -> order.getAmount() > fraudThreshold,
+                .filter((orderId, order) ->
+                                order.getAmount() != null
+                                        && order.getAmount().compareTo(fraudThreshold) > 0,
                         Named.as("fraud-filter"))
                 .peek((k, v) -> log.warn("🚨 FRAUD ALERT – orderId={} amount=${} customer={}",
                         v.getOrderId(), v.getAmount(), v.getCustomerId()))
@@ -156,7 +172,9 @@ public class OrderStreamTopology {
                                 .withName("fraud-alerts-sink"));
 
         // ════════════════════════════════════════════════════════════════
-        //  STEP 6 – CATEGORY SALES AGGREGATION (Tumbling Window – 1 minute)
+        //  STEP 6 – CATEGORY SALES AGGREGATION
+        //           Tumbling window: 1 minute size + 30 second grace,
+        //           suppressed so each window emits a single final result.
         //
         //  SQL equivalent (ksqlDB):
         //    SELECT category, COUNT(*), SUM(amount), AVG(amount)
@@ -167,7 +185,7 @@ public class OrderStreamTopology {
         //  The result is materialised in "category-sales-store" for
         //  Interactive Queries (AnalyticsController).
         // ═══════════════════════════════════════════════════════���════════
-        enrichedStream
+        KTable<Windowed<String>, CategorySales> categorySalesTable = enrichedStream
                 .groupBy(
                         (orderId, order) -> order.getCategory(),
                         Grouped.<String, EnrichedOrder>as("grouped-by-category")
@@ -175,7 +193,10 @@ public class OrderStreamTopology {
                                 .withValueSerde(enrichedOrderSerde)
                 )
                 .windowedBy(
-                        TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1))
+                        // 1-minute tumbling window with a 30s grace period, so a record
+                        // that arrives slightly late still lands in the window its EVENT
+                        // time says it belongs to instead of being silently dropped.
+                        TimeWindows.ofSizeAndGrace(WINDOW_SIZE, WINDOW_GRACE)
                 )
                 .aggregate(
                         CategorySales::new,                   // initializer
@@ -185,12 +206,20 @@ public class OrderStreamTopology {
                                 .<String, CategorySales, WindowStore<Bytes, byte[]>>as(CATEGORY_SALES_STORE)
                                 .withKeySerde(Serdes.String())
                                 .withValueSerde(categorySalesSerde)
-                )
+                );
+
+        categorySalesTable
+                // Emit ONE final record per window instead of an update per input record.
+                // The buffer is unbounded: it holds a window's aggregate in memory until
+                // window end + grace has passed, then forwards the final value downstream.
+                .suppress(Suppressed.untilWindowCloses(Suppressed.BufferConfig.unbounded()))
                 .toStream(Named.as("category-sales-stream"))
                 .map((windowedKey, sales) -> {
                     // Bug fix: SLF4J uses {} placeholders, not printf-style ${:.2f}
-                    log.info("📊 Category [{}] orders={} totalSales={}",
-                            windowedKey.key(), sales.getOrderCount(), sales.getTotalSales());
+                    log.info("📊 Category [{}] window=[{} .. {}] orders={} totalSales={}",
+                            windowedKey.key(),
+                            windowedKey.window().startTime(), windowedKey.window().endTime(),
+                            sales.getOrderCount(), sales.getTotalSales());
                     return new org.apache.kafka.streams.KeyValue<>(windowedKey.key(), sales);
                 })
                 .to(categorySalesTopic,
@@ -198,10 +227,25 @@ public class OrderStreamTopology {
                                 .withName("category-sales-sink"));
 
         // ════════════════════════════════════════════════════════════════
-        //  STEP 7 – CUSTOMER SPENDING TRACKER (Session Window – 5 minutes)
+        //  STEP 7 – CUSTOMER SPENDING TRACKER (UNBOUNDED running total)
         //
-        //  Groups orders by customerId; session gaps > 5 min close the window.
+        //  NOTE: this is NOT a session window. It is a plain `aggregate` with no
+        //  `windowedBy(...)`, i.e. a lifetime running total per customerId that is
+        //  never expired. (The previous comment here claimed "Session Window –
+        //  5 minutes" and "session gaps > 5 min close the window"; no such code
+        //  existed. Corrected rather than implemented — see the TODO below.)
+        //
         //  Materialised as a KeyValueStore for Interactive Queries.
+        //
+        //  TODO(A4): this store grows without bound — one entry per customerId that
+        //  is retained forever, plus an ever-growing changelog topic. Converting it
+        //  to a SessionWindows aggregation (5-minute inactivity gap) is task A4.
+        //
+        //  TODO(money): the running total is still a `double` (Serdes.Double), so it
+        //  carries the same compounding float error the category aggregate just shed.
+        //  Migrating it to BigDecimal changes the state-store value type, which the
+        //  AnalyticsController reads via Interactive Queries — deliberately left to
+        //  the agent that owns that controller.
         // ════════════════════════════════════════════════════════════════
         enrichedStream
                 .groupBy(
@@ -212,7 +256,11 @@ public class OrderStreamTopology {
                 )
                 .aggregate(
                         () -> 0.0,
-                        (customerId, order, totalSpent) -> totalSpent + order.getAmount(),
+                        (customerId, order, totalSpent) -> order.getAmount() == null
+                                ? totalSpent
+                                : BigDecimal.valueOf(totalSpent)
+                                        .add(order.getAmount())
+                                        .doubleValue(),
                         Materialized
                                 .<String, Double, KeyValueStore<Bytes, byte[]>>as(CUSTOMER_SPENDING_STORE)
                                 .withKeySerde(Serdes.String())

@@ -6,6 +6,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.math.BigDecimal;
+
 /**
  * Represents a product in the catalog, stored as a compacted KTable in the "products" topic.
  * Key = productId (enables KStream-KTable join for order enrichment).
@@ -20,7 +22,8 @@ public class Product {
     private String productId;
     private String name;
     private String category;
-    private double price;
+    /** Catalog price in USD – BigDecimal to keep money exact. */
+    private BigDecimal price;
     private String brand;
     private String description;
 }
