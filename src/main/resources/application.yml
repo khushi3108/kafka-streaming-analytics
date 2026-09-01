@@ -1,0 +1,57 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: ecommerce-kafka-streaming
+
+  kafka:
+    # Single source of truth for broker address
+    bootstrap-servers: localhost:9092
+
+    # ── Producer ──────────────────────────────────────────────────────
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+    # ── Admin ─────────────────────────────────────────────────────────
+    # fail-fast=false: don't crash on startup if Kafka is briefly unavailable
+    admin:
+      fail-fast: false
+
+    # ── Kafka Streams ─────────────────────────────────────────────────
+    # Only application-id and bootstrap-servers go here.
+    # ALL other StreamsConfig properties are set in KafkaStreamsConfig.java
+    # to avoid duplicate/conflicting config.
+    streams:
+      application-id: ecommerce-streams-app
+      bootstrap-servers: localhost:9092
+
+# ── Application config ────────────────────────────────────────────────
+app:
+  topics:
+    orders: orders
+    products: products
+    enriched-orders: enriched-orders
+    fraud-alerts: fraud-alerts
+    category-sales: category-sales
+  fraud:
+    threshold: 500.0
+
+# ── Actuator ──────────────────────────────────────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,kafkastreams
+  endpoint:
+    health:
+      show-details: always
+
+# ── Logging ───────────────────────────────────────────────────────────
+logging:
+  level:
+    root: INFO
+    com.ecommerce.streaming: DEBUG
+    org.apache.kafka.streams: WARN
+    org.apache.kafka.clients: WARN
