@@ -3,9 +3,11 @@ package com.ecommerce.streaming.producer;
 import com.ecommerce.streaming.model.Product;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -17,7 +19,29 @@ import java.util.List;
  * "products" Kafka topic. The Kafka Streams topology reads this topic as a
  * KTable (key = productId) for order-enrichment joins.
  *
- * @PostConstruct ensures catalog is populated before the first order arrives.
+ * <h2>Why this is NOT {@code @PostConstruct} any more</h2>
+ *
+ * <p>Seeding used to run from {@code @PostConstruct}, i.e. during bean initialisation, and
+ * called {@code kafkaTemplate.send()} directly. {@code send()} is only asynchronous once the
+ * producer HAS metadata: the first call blocks up to {@code max.block.ms} waiting for it and
+ * then throws a {@code KafkaException} <em>synchronously</em> if no broker answers. Thrown from
+ * {@code @PostConstruct} that becomes a {@code BeanCreationException}, so <b>the Spring context
+ * could not start at all without a live broker</b> — every {@code @SpringBootTest} in the
+ * project failed before it ran a single assertion, and a production pod that started a few
+ * seconds ahead of Kafka crash-looped instead of waiting.
+ *
+ * <p>Two changes fix that while keeping production behaviour identical:
+ * <ol>
+ *   <li>Seeding moved to {@link ApplicationReadyEvent} — after the context is fully refreshed,
+ *       so a failure degrades the catalog instead of killing the application.</li>
+ *   <li>{@link #initializeCatalog()} never propagates an exception. A broker that is not up yet
+ *       is logged as a warning; the compacted {@code products} topic can be re-seeded at any
+ *       time by calling this method again, and the topology already left-joins so orders keep
+ *       flowing (as "Unknown Product") in the meantime.</li>
+ * </ol>
+ *
+ * <p>{@code app.catalog.seed-on-startup} (default {@code true}, so production is unchanged)
+ * turns the startup seeding off entirely — which is what tests set.
  */
 @Slf4j
 @Service
@@ -29,22 +53,66 @@ public class ProductProducer {
 
     private static final String TOPIC = "products";
 
-    @PostConstruct
-    public void initializeCatalog() {
+    /**
+     * Whether to publish the catalog when the application becomes ready.
+     * Defaults to {@code true} — production behaviour is unchanged. Tests set it to
+     * {@code false} so no broker is needed to bring the context up.
+     */
+    @Value("${app.catalog.seed-on-startup:true}")
+    private boolean seedOnStartup;
+
+    /**
+     * Seed the catalog once the application is fully started.
+     *
+     * <p>Deliberately an {@link ApplicationReadyEvent} listener rather than
+     * {@code @PostConstruct}: bean initialisation must not depend on a remote system being
+     * reachable. Never throws — see the class javadoc.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void seedCatalogOnStartup() {
+        if (!seedOnStartup) {
+            log.info("📦 Product catalog seeding disabled (app.catalog.seed-on-startup=false).");
+            return;
+        }
+        initializeCatalog();
+    }
+
+    /**
+     * Publish every catalog entry to the compacted {@code products} topic.
+     *
+     * <p>Resilient by contract: a serialization failure or an unreachable broker is logged and
+     * skipped, never rethrown. Safe to call repeatedly — the topic is compacted and keyed by
+     * productId, so re-seeding overwrites rather than duplicates.
+     *
+     * @return the number of products successfully handed to the producer
+     */
+    public int initializeCatalog() {
         log.info("📦 Initialising product catalog ({} products)...", CATALOG.size());
-        CATALOG.forEach(product -> {
+        int published = 0;
+        for (Product product : CATALOG) {
             try {
                 String json = objectMapper.writeValueAsString(product);
+                // send() blocks for metadata on the first call and throws synchronously when the
+                // broker is unreachable, so it has to be inside the try — not just the callback.
                 kafkaTemplate.send(TOPIC, product.getProductId(), json)
                         .whenComplete((r, ex) -> {
                             if (ex == null) log.debug("  → Product [{}] published", product.getProductId());
                             else log.error("  → Failed to publish product [{}]", product.getProductId(), ex);
                         });
+                published++;
             } catch (JsonProcessingException e) {
                 log.error("Cannot serialize product {}", product.getProductId(), e);
+            } catch (RuntimeException e) {
+                // Typically KafkaException("Topic ... not present in metadata after N ms") when the
+                // broker is not up yet. Log and continue: an unseeded catalog is a degraded
+                // enrichment join, not a reason to take the application down.
+                log.warn("  → Could not publish product [{}] ({}): {}",
+                        product.getProductId(), e.getClass().getSimpleName(), e.getMessage());
             }
-        });
-        log.info("✅ Product catalog initialisation complete.");
+        }
+        log.info("✅ Product catalog initialisation complete ({} of {} published).",
+                published, CATALOG.size());
+        return published;
     }
 
     // ── Static product catalog ─────────────────────────────────────────
