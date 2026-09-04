@@ -42,6 +42,26 @@ public class OrderAlert {
      *  CRITICAL (> $2000), HIGH (> $1000), MEDIUM (> $500)
      */
     private String severity;
+
+    /**
+     * Human-readable justification for the alert.
+     *
+     * <p>Per-order signals (HIGH_VALUE, BASELINE_DEVIATION) are self-explanatory from the
+     * other fields, but the AGGREGATE signals are not: a VELOCITY or SESSION_BURST alert
+     * carries only a customerId and a total amount, and the number of orders behind it —
+     * the actual reason it fired — had nowhere to go. This field carries it.
+     *
+     * <p>It is deliberately NOT part of {@link #deterministicAlertId}: it is descriptive
+     * text, and changing the wording must not change an alert's identity. It must still be
+     * derived only from the input records (never a clock or a random source) so that a
+     * replayed record produces a byte-identical alert.
+     */
+    private String reason;
+
+    /**
+     * EVENT time of the alert in epoch millis — the order's own timestamp for per-order
+     * signals, the last event time in the window for aggregate signals. Never the wall clock.
+     */
     private long timestamp;
 
     private static final BigDecimal SEVERITY_CRITICAL = new BigDecimal("2000");
@@ -97,6 +117,10 @@ public class OrderAlert {
                 .quantity(order.getQuantity())
                 .alertType(alertType)
                 .severity(severity)
+                // Derived purely from the record, so it stays replay-stable like every other field.
+                .reason(alertType + ": order " + order.getOrderId()
+                        + " for " + amount.toPlainString()
+                        + " (" + order.getQuantity() + " x " + order.getProductName() + ")")
                 // Event time of the order, NOT wall-clock time. A replayed order must produce a
                 // byte-identical alert, and this is also the same clock the topology windows on
                 // (OrderTimestampExtractor) and the clock ksqlDB uses (TIMESTAMP='timestamp').

@@ -67,6 +67,56 @@ public class CategorySales {
         return this;
     }
 
+    /**
+     * Combine two partial aggregates for the SAME (category, window) into one.
+     *
+     * <p>Used by the multi-instance Interactive Query fan-out in
+     * {@code InteractiveQueryService}: a windowed scan collects one bucket per instance and
+     * has to reduce them into a single answer. Under the standard partitioning a given
+     * (category, window) lives on exactly one instance, so this is normally a no-op — but
+     * "normally" is not "always" (a scan issued mid-rebalance can see the same task on both
+     * the old and the new owner), and the previous controller resolved that collision by
+     * KEEPING WHICHEVER BUCKET HAD MORE ORDERS and discarding the other. That is silent data
+     * loss. Summing is the only answer that is arithmetically defensible.
+     *
+     * <p>The average is recomputed from the summed totals — averaging two averages would be
+     * wrong whenever the two buckets have different order counts. Min/max are folded, not
+     * summed, because they are extrema rather than totals.
+     */
+    public static CategorySales merge(CategorySales left, CategorySales right) {
+        if (left == null) return right;
+        if (right == null) return left;
+
+        CategorySales merged = new CategorySales();
+        merged.category = left.category != null ? left.category : right.category;
+        merged.orderCount = left.orderCount + right.orderCount;
+        merged.totalSales = money(nullToZero(left.totalSales).add(nullToZero(right.totalSales)));
+        merged.totalQuantity = left.totalQuantity + right.totalQuantity;
+        merged.avgOrderValue = merged.orderCount == 0
+                ? BigDecimal.ZERO.setScale(MONEY_SCALE)
+                : merged.totalSales.divide(
+                        BigDecimal.valueOf(merged.orderCount), MONEY_SCALE, MONEY_ROUNDING);
+        merged.maxOrderValue = maxOf(left.maxOrderValue, right.maxOrderValue);
+        merged.minOrderValue = minOf(left.minOrderValue, right.minOrderValue);
+        return merged;
+    }
+
+    private static BigDecimal maxOf(BigDecimal a, BigDecimal b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        return a.compareTo(b) >= 0 ? a : b;
+    }
+
+    private static BigDecimal minOf(BigDecimal a, BigDecimal b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        return a.compareTo(b) <= 0 ? a : b;
+    }
+
+    private static BigDecimal nullToZero(BigDecimal v) {
+        return v == null ? BigDecimal.ZERO : v;
+    }
+
     private static BigDecimal money(BigDecimal v) {
         return v.setScale(MONEY_SCALE, MONEY_ROUNDING);
     }

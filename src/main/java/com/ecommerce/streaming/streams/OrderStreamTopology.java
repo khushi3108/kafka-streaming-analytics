@@ -18,7 +18,6 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
-import java.util.UUID;
 
 /**
  * ═══════════════════════════════════════════════════════════════════════
@@ -396,7 +395,7 @@ public class OrderStreamTopology {
                             windowedKey.key(), spending.getOrderCount(), spending.getTotalSpent(),
                             windowedKey.window().startTime(), windowedKey.window().endTime());
                     return KeyValue.pair(windowedKey.key(),
-                            aggregateAlert(windowedKey.key(), spending, "VELOCITY", "HIGH"));
+                            aggregateAlert(windowedKey, spending, "VELOCITY", "HIGH"));
                 }, Named.as("build-velocity-alert"));
 
         // ── SIGNAL 3: SESSION_BURST (session window) ────────────────────
@@ -442,7 +441,7 @@ public class OrderStreamTopology {
                             windowedKey.key(), spending.getOrderCount(), spending.getTotalSpent(),
                             windowedKey.window().startTime(), windowedKey.window().endTime());
                     return KeyValue.pair(windowedKey.key(),
-                            aggregateAlert(windowedKey.key(), spending, "SESSION_BURST", severity));
+                            aggregateAlert(windowedKey, spending, "SESSION_BURST", severity));
                 }, Named.as("build-session-alert"));
 
         // ── SIGNAL 4: BASELINE_DEVIATION (stream ⋈ table) ───────────────
@@ -563,21 +562,54 @@ public class OrderStreamTopology {
      * <p>{@code orderId}/{@code productId}/{@code category} are intentionally left null:
      * the alert is about the customer's behaviour over a window, not about any single
      * order, and inventing a representative orderId would be misleading. {@code amount}
-     * carries the window's TOTAL spend. (A dedicated free-text {@code reason} field on
-     * OrderAlert would let these alerts carry the order count too — see the handover note;
-     * OrderAlert is owned by another change right now, so it is left untouched.)
+     * carries the window's TOTAL spend, and {@code reason} carries the order count behind it —
+     * the fact that actually justifies the alert and previously had nowhere to go.
+     *
+     * <p><b>Determinism (the carry-over fix).</b> This helper still stamped
+     * {@code UUID.randomUUID()} and {@code System.currentTimeMillis()} long after
+     * {@link OrderAlert#fromEnrichedOrder} had been made replay-stable, so two of the four
+     * signals quietly kept the old behaviour: replay the same burst and you got a second alert
+     * with a different id and a different timestamp, indistinguishable from a genuine new
+     * incident. Both are now derived purely from the input:
+     *
+     * <ul>
+     *   <li><b>identity includes the WINDOW.</b> {@code customerId + "@" + window.start()}, not
+     *       the customerId alone. Keying on the customer alone would collapse every window that
+     *       customer ever triggers onto ONE alert id — a consumer deduping on alertId would then
+     *       drop every burst after the first, which is worse than the random ids it replaced.
+     *       The window start is the thing that makes two bursts by the same customer two
+     *       different events.</li>
+     *   <li><b>timestamp is EVENT time</b> — the last order time folded into the window's
+     *       aggregate. Same clock as the windowing, the same clock as ksqlDB, and stable across
+     *       a replay.</li>
+     * </ul>
      */
-    private static OrderAlert aggregateAlert(String customerId,
+    private static OrderAlert aggregateAlert(Windowed<String> windowedKey,
                                              CustomerSpending spending,
                                              String alertType,
                                              String severity) {
+        String customerId = windowedKey.key();
+        long windowStart = windowedKey.window().start();
+
+        // Identity = customer + window. Both come from the record stream, never from a clock.
+        String identity = customerId + "@" + windowStart;
+
+        // Plain concatenation rather than String.format: no default-Locale dependency, so the
+        // text is byte-identical on any JVM (the alert as a whole is meant to be replay-stable).
+        String reason = alertType + ": " + spending.getOrderCount() + " orders totalling "
+                + (spending.getTotalSpent() == null ? "0" : spending.getTotalSpent().toPlainString())
+                + " between " + windowedKey.window().startTime()
+                + " and " + windowedKey.window().endTime();
+
         return OrderAlert.builder()
-                .alertId(UUID.randomUUID().toString())
+                .alertId(OrderAlert.deterministicAlertId(identity, alertType, severity))
                 .customerId(customerId)
                 .amount(spending.getTotalSpent())
                 .alertType(alertType)
                 .severity(severity)
-                .timestamp(System.currentTimeMillis())
+                .reason(reason)
+                // EVENT time of the last order in the window, NOT the wall clock.
+                .timestamp(spending.getLastOrderTimestamp())
                 .build();
     }
 }

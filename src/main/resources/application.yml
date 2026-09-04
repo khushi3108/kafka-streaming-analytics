@@ -77,6 +77,47 @@ app:
   fraud:
     threshold: 500.0
 
+  # ── Kafka Streams instance identity + Interactive Query RPC ─────────
+  # These drive MULTI-INSTANCE Interactive Queries. A state store is sharded by
+  # partition: an instance can only read the partitions it was assigned, so
+  # store.all() / fetchAll() see ONE INSTANCE'S SLICE of the data. Answering a
+  # cluster-wide question means discovering the peers and asking them — which is
+  # only possible if every instance advertises a reachable address here.
+  streams:
+    # StreamsConfig.APPLICATION_SERVER_CONFIG — this instance's RPC endpoint, published
+    # to every other instance through the consumer group metadata. Left blank, the code
+    # defaults it to localhost:${server.port}, which is what makes a two-JVM run on one
+    # laptop work with nothing but `--server.port=8091`.
+    #
+    # IN A CONTAINER / KUBERNETES YOU MUST SET THIS to an address the OTHER pods can
+    # reach (the pod IP or the headless-service DNS name). `localhost` inside a pod
+    # resolves to that pod, so leaving the default in place makes every instance
+    # advertise itself as everyone else's loopback and the fan-out queries itself.
+    #   e.g. application-server: ${POD_IP}:8090
+    application-server: ""
+
+    # PER-INSTANCE RocksDB directory. The leaf directory is derived from host:port,
+    # because RocksDB takes an EXCLUSIVE file lock on the state directory: with a single
+    # shared path a second JVM on the same machine dies with "Failed to lock the state
+    # directory" — i.e. the very multi-instance topology the fan-out exists to serve
+    # could not be brought up locally at all. The application-id still groups the
+    # instances; only the on-disk location differs.
+    state-dir: /tmp/kafka-streams/ecommerce
+
+    # Peer-to-peer RPC leg of the fan-out. Uses Spring's RestClient (already on the
+    # classpath via spring-boot-starter-web) — no new dependency.
+    rpc:
+      scheme: http
+      # SimpleClientHttpRequestFactory has NO timeouts by default. One paused JVM or
+      # half-open socket would otherwise hang the coordinating request — and the servlet
+      # thread serving the client — indefinitely. Bounded timeouts turn "one sick
+      # instance" into "a result that declares itself partial".
+      connect-timeout-ms: 1000
+      read-timeout-ms: 3000
+      # One budget for the WHOLE fan-out, not per peer: three dead peers must not add up
+      # to a 9s request.
+      fan-out-timeout-ms: 5000
+
 # ── Actuator ──────────────────────────────────────────────────────────
 management:
   endpoints:

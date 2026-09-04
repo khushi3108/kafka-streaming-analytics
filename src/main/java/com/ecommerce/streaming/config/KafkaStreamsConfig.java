@@ -5,12 +5,14 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.state.HostInfo;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.annotation.EnableKafkaStreams;
 import org.springframework.kafka.annotation.KafkaStreamsDefaultConfiguration;
 import org.springframework.kafka.config.KafkaStreamsConfiguration;
+import org.springframework.util.StringUtils;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -30,6 +32,55 @@ import java.util.Map;
 public class KafkaStreamsConfig {
 
     /**
+     * This instance's RPC endpoint, published to every other instance of the application
+     * through the Streams group metadata as {@code application.server}.
+     *
+     * <p><b>This is the discovery mechanism the whole multi-instance Interactive Query story
+     * rests on.</b> Kafka Streams gives each instance only the partitions it was assigned, so
+     * {@code store.all()} on one instance can only ever see that instance's slice of the data.
+     * To answer a question about the WHOLE application, an instance has to know who else exists
+     * and which keys they own — and {@code queryMetadataForKey} /
+     * {@code streamsMetadataForStore} can only tell you that if every instance has advertised a
+     * reachable address here. With this unset (as it was), both APIs return
+     * {@code HostInfo("unavailable", -1)} and there is literally no way to discover the peers.
+     *
+     * <p>Exposed as a bean so {@code InteractiveQueryService} resolves "am I the active host for
+     * this key?" against exactly the same value that was advertised — a second, independently
+     * computed copy of the host string would eventually disagree and send an instance into an
+     * RPC loop with itself.
+     *
+     * <p>Defaults to {@code localhost:${server.port}}, which is what makes running two JVMs on
+     * one laptop work with nothing but {@code --server.port=8091}. In a container set
+     * {@code app.streams.application-server} to an address the OTHER pods can actually reach —
+     * {@code localhost} inside a pod resolves to that pod, so leaving the default in place in
+     * Kubernetes means every instance advertises itself as everyone else's loopback.
+     */
+    @Bean
+    public HostInfo applicationServerHostInfo(
+            @Value("${app.streams.application-server:}") String applicationServer,
+            @Value("${server.port:8080}") int serverPort) {
+
+        String endpoint = StringUtils.hasText(applicationServer)
+                ? applicationServer.trim()
+                : "localhost:" + serverPort;
+
+        int colon = endpoint.lastIndexOf(':');
+        if (colon <= 0 || colon == endpoint.length() - 1) {
+            throw new IllegalArgumentException(
+                    "app.streams.application-server must be host:port, got: '" + endpoint + "'");
+        }
+        String host = endpoint.substring(0, colon);
+        int port;
+        try {
+            port = Integer.parseInt(endpoint.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "app.streams.application-server has a non-numeric port: '" + endpoint + "'", e);
+        }
+        return new HostInfo(host, port);
+    }
+
+    /**
      * Primary Kafka Streams configuration bean.
      *
      * @Value moved to METHOD PARAMETERS (not class fields) so Spring guarantees
@@ -39,7 +90,9 @@ public class KafkaStreamsConfig {
     @Bean(name = KafkaStreamsDefaultConfiguration.DEFAULT_STREAMS_CONFIG_BEAN_NAME)
     public KafkaStreamsConfiguration kStreamsConfig(
             @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
-            @Value("${spring.kafka.streams.application-id}") String applicationId) {
+            @Value("${spring.kafka.streams.application-id}") String applicationId,
+            @Value("${app.streams.state-dir:/tmp/kafka-streams/ecommerce}") String stateDirBase,
+            HostInfo applicationServerHostInfo) {
 
         Map<String, Object> props = new HashMap<>();
 
@@ -150,8 +203,29 @@ public class KafkaStreamsConfig {
         props.put(StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG,
                 DeadLetterDeserializationExceptionHandler.class);
 
+        // ─── Interactive Query RPC endpoint ──────────────────────
+        // Advertised to every other instance via the consumer group's subscription metadata.
+        // Without it, streamsMetadataForStore()/queryMetadataForKey() report
+        // HostInfo("unavailable", -1) and cross-instance queries are impossible — which is why
+        // the REST API used to answer with only this instance's partitions and call it complete.
+        String applicationServer =
+                applicationServerHostInfo.host() + ":" + applicationServerHostInfo.port();
+        props.put(StreamsConfig.APPLICATION_SERVER_CONFIG, applicationServer);
+
         // ─── State store ─────────────────────────────────────────
-        props.put(StreamsConfig.STATE_DIR_CONFIG, "/tmp/kafka-streams/ecommerce");
+        // PER-INSTANCE state directory. This was hardcoded to a single shared path, which is
+        // fine for exactly one JVM and actively breaks the moment there are two: RocksDB takes
+        // an exclusive file lock on the state directory, so a second instance started on the
+        // same machine dies with "Failed to lock the state directory" — meaning the very
+        // multi-instance topology the RPC fan-out exists to serve could not be brought up
+        // locally at all. Deriving the leaf directory from host:port gives each JVM its own
+        // RocksDB tree.
+        //
+        // Note the application-id is still the shared identity that groups the instances; only
+        // the on-disk location differs. Two instances sharing a host but not a port therefore
+        // cooperate over Kafka while staying out of each other's files.
+        String stateDir = stateDirBase + "/" + applicationServer.replace(':', '-');
+        props.put(StreamsConfig.STATE_DIR_CONFIG, stateDir);
 
         return new KafkaStreamsConfiguration(props);
     }
