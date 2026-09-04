@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------
+# Namespace
+#
+# The namespace name is part of every pod's DNS name, and therefore part of the
+# `app.streams.application-server` value each instance advertises to its peers
+# (see 30-statefulset.yaml). Renaming the namespace changes that advertised address,
+# which changes the per-instance RocksDB directory name derived from it in
+# KafkaStreamsConfig.java — i.e. it forces a full changelog restore. Pick it once.
+# ---------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka-analytics
+  labels:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/part-of: ecommerce-kafka-streaming
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

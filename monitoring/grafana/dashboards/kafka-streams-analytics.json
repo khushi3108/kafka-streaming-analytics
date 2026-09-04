@@ -1,0 +1,452 @@
+{
+  "uid": "kafka-streams-analytics",
+  "title": "Kafka Streams — E-Commerce Analytics",
+  "description": "Operational dashboard for the ecommerce-streams application. Ordered by what you look at first during an incident: consumer lag, then stream state, then throughput, then the JVM. Lag panels come from kafka-exporter (the broker's view, works even when the app is down); stream panels come from Micrometer via /actuator/prometheus and stay empty until micrometer-registry-prometheus is on the classpath.",
+  "tags": ["kafka", "kafka-streams", "ecommerce"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "graphTooltip": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "consumergroup",
+        "label": "Consumer group",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(kafka_consumergroup_lag, consumergroup)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "ecommerce-streams-app", "value": "ecommerce-streams-app" }
+      },
+      {
+        "name": "instance",
+        "label": "App instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(up{job=\"ecommerce-streams\"}, instance)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Consumer lag — start here",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Total lag (all topics)",
+      "description": "Sum of committed-offset-to-log-end-offset across every partition this consumer group reads. This is the single number that says whether the application is keeping up. Flat-and-large is 'behind but keeping pace'; rising is 'will never catch up'.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 5, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"$consumergroup\"})",
+          "legendFormat": "lag"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10000 },
+              { "color": "red", "value": 50000 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 2,
+      "title": "Lag by topic",
+      "description": "Which input is falling behind. `orders` lagging means ingestion outpaces the topology; a changelog or repartition topic lagging usually means a restore is in progress.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 10, "x": 5, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (topic) (kafka_consumergroup_lag{consumergroup=\"$consumergroup\"})",
+          "legendFormat": "{{topic}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "Lag per partition — `orders`",
+      "description": "Per-partition lag exposes SKEW, which the aggregate hides. One partition lagging while the others are flat means either a hot key (all orders for one customer land on one partition) or one instance in trouble — and only three partitions exist, so one bad partition is a third of the traffic.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (partition) (kafka_consumergroup_lag{consumergroup=\"$consumergroup\", topic=\"orders\"})",
+          "legendFormat": "partition {{partition}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "Lag trend (records/s of drift)",
+      "description": "deriv() over the lag series. Above zero the backlog is growing; below zero it is draining. This is the panel that distinguishes a transient spike from a genuine capacity problem, and it is the signal a lag-based HPA/KEDA autoscaler should be driven by (see k8s/41-hpa.yaml).",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (topic) (deriv(kafka_consumergroup_lag{consumergroup=\"$consumergroup\"}[10m]))",
+          "legendFormat": "{{topic}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 5,
+      "title": "Topic throughput (records/s written)",
+      "description": "Rate of change of the log end offset — how fast records are being PRODUCED to each topic. Compare against the process rate below: if input rate exceeds process rate, lag grows by the difference.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (topic) (rate(kafka_topic_partition_current_offset{topic=~\"orders|enriched-orders|fraud-alerts|category-sales|dead-letter\"}[5m]))",
+          "legendFormat": "{{topic}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Stream state and processing  —  requires micrometer-registry-prometheus",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "id": 6,
+      "title": "Kafka Streams state per instance",
+      "description": "KafkaStreams.State as an ordinal: 0 CREATED, 1 REBALANCING, 2 RUNNING, 3 PENDING_SHUTDOWN, 4 NOT_RUNNING, 5 PENDING_ERROR, 6 ERROR. Only 2 (RUNNING) serves Interactive Queries — every other value means the REST API is answering 503 or the Kubernetes readiness probe has pulled the pod out of the Service. Brief dips to 1 on a deploy are normal; a sustained 1 is a stuck rebalance.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "kafka_stream_state{job=\"ecommerce-streams\", instance=~\"$instance\"}",
+          "legendFormat": "{{instance_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 6,
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 20, "showPoints": "never" },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "CREATED", "color": "yellow", "index": 0 },
+                "1": { "text": "REBALANCING", "color": "orange", "index": 1 },
+                "2": { "text": "RUNNING", "color": "green", "index": 2 },
+                "3": { "text": "PENDING_SHUTDOWN", "color": "orange", "index": 3 },
+                "4": { "text": "NOT_RUNNING", "color": "red", "index": 4 },
+                "5": { "text": "PENDING_ERROR", "color": "red", "index": 5 },
+                "6": { "text": "ERROR", "color": "dark-red", "index": 6 }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 7,
+      "title": "Stream thread process rate (records/s)",
+      "description": "Records processed per second, per stream thread (NUM_STREAM_THREADS=2 per instance). Read together with the topic throughput panel: sustained process rate below input rate is exactly what produces the lag above it. A drop to zero on one instance while others keep working points at a stuck task, not at a load change.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance_name) (kafka_stream_thread_process_rate{job=\"ecommerce-streams\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance_name}} — total"
+        },
+        {
+          "refId": "B",
+          "expr": "kafka_stream_thread_process_rate{job=\"ecommerce-streams\", instance=~\"$instance\"}",
+          "legendFormat": "{{instance_name}} / {{thread_id}}",
+          "hide": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 8,
+      "title": "Commit rate & commit latency",
+      "description": "COMMIT_INTERVAL_MS is 100ms under EXACTLY_ONCE_V2, so each commit is a Kafka transaction and the commit rate should sit near 10/s per thread. Commit latency rising is the earliest warning that the transaction coordinator or the changelog writes are struggling — it shows up here well before it shows up as lag.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 21 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance_name) (kafka_stream_thread_commit_rate{job=\"ecommerce-streams\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance_name}} commits/s"
+        },
+        {
+          "refId": "B",
+          "expr": "max by (instance_name) (kafka_stream_thread_commit_latency_avg{job=\"ecommerce-streams\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance_name}} commit latency avg"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*commit latency.*" },
+            "properties": [
+              { "id": "unit", "value": "ms" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 9,
+      "title": "Active tasks per instance",
+      "description": "How the 3 partitions are actually distributed. This is the panel that shows a rebalance happening and shows whether adding an instance did anything: with 3 partitions, a 4th instance shows up here with zero tasks — which is why k8s/41-hpa.yaml caps maxReplicas at 3.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 21 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count by (instance_name) (kafka_stream_task_process_rate{job=\"ecommerce-streams\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 20, "stacking": { "mode": "normal" }, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+
+    {
+      "type": "row",
+      "id": 102,
+      "title": "JVM and broker health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "collapsed": true,
+      "panels": [
+        {
+          "type": "timeseries",
+          "id": 10,
+          "title": "JVM heap used",
+          "description": "The image runs -XX:MaxRAMPercentage=60, so heap tops out well below the container limit on purpose: RocksDB's block cache, memtables and index blocks are OFF-heap and need the remaining 40%. A healthy-looking heap next to an OOMKill is the classic symptom of sizing the heap at 75% here.",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 28 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (instance_name) (jvm_memory_used_bytes{job=\"ecommerce-streams\", area=\"heap\", instance=~\"$instance\"})",
+              "legendFormat": "{{instance_name}} used"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (instance_name) (jvm_memory_max_bytes{job=\"ecommerce-streams\", area=\"heap\", instance=~\"$instance\"})",
+              "legendFormat": "{{instance_name}} max"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi" }
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 11,
+          "title": "GC pause time",
+          "description": "Long pauses matter more here than in a stateless service: a pause longer than the consumer's max.poll.interval.ms gets the instance evicted from the group, triggering a rebalance and a partial state restore.",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 28 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (instance_name) (rate(jvm_gc_pause_seconds_sum{job=\"ecommerce-streams\", instance=~\"$instance\"}[5m]))",
+              "legendFormat": "{{instance_name}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi" }
+          }
+        },
+        {
+          "type": "stat",
+          "id": 12,
+          "title": "Under-replicated partitions",
+          "description": "Must be zero. The brokers run min.insync.replicas=2 to back EXACTLY_ONCE_V2; below two in-sync replicas the broker REFUSES writes rather than accepting them under-replicated, so producers start failing outright.",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 28 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(kafka_topic_partition_under_replicated_partition)",
+              "legendFormat": "under-replicated"
+            }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "background",
+            "graphMode": "area"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        }
+      ]
+    }
+  ]
+}

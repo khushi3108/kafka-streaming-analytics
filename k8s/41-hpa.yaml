@@ -1,0 +1,109 @@
+# =====================================================================
+#  HorizontalPodAutoscaler
+#
+#  READ THE CAVEATS BEFORE ENABLING THIS. Autoscaling a Kafka Streams application is not the
+#  same thing as autoscaling a stateless web service, and the naive configuration actively
+#  hurts.
+#
+#  CAVEAT 1 — maxReplicas is capped by the PARTITION COUNT, not by load.
+#    Kafka assigns whole partitions to instances. The `orders` topic has 3 partitions
+#    (docker/kafka-init.sh), so a 4th instance is assigned nothing: it holds no tasks, serves
+#    no state, and still consumes a pod's memory and still participates in every fan-out.
+#    maxReplicas: 3 is therefore a HARD ceiling derived from the topic, not a guess.
+#    If the partition count changes, change this number in the same commit.
+#
+#  CAVEAT 2 — every scale event costs a rebalance AND a state restore.
+#    Adding a pod reassigns partitions across the whole group; the new pod then restores the
+#    state for its partitions from the changelog topics before it can answer anything. During
+#    that window throughput DROPS. An HPA tuned like a stateless service's — short
+#    stabilisation, aggressive policies — will scale up under load, make the latency worse
+#    for the duration of the restore, see the metric spike further, and scale up again. The
+#    stabilisation windows and single-pod policies below exist specifically to stop that.
+#
+#  CAVEAT 3 — CPU is a proxy, not the real signal.
+#    What actually indicates "this application is behind" is CONSUMER LAG, not CPU. The right
+#    metric is `kafka_consumergroup_lag` (exported by kafka-exporter — see
+#    monitoring/prometheus.yml), consumed through prometheus-adapter or KEDA as an external
+#    metric. CPU is used here because it needs nothing beyond metrics-server, which every
+#    cluster has. The lag-based alternative is written out (commented) at the bottom.
+#
+#  CAVEAT 4 — scale-down orphans, it does not destroy.
+#    Scaling from 3 to 2 removes pod-2 but KEEPS PVC `state-ecommerce-streams-2`. That is
+#    deliberate (see the StatefulSet's volumeClaimTemplates note): scaling back up re-attaches
+#    the existing state instead of restoring from scratch. It does mean idle PVCs cost money
+#    between scale events.
+# =====================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ecommerce-streams
+  namespace: kafka-analytics
+  labels:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: ecommerce-streams
+
+  minReplicas: 2
+  maxReplicas: 3   # == partition count of `orders`. See CAVEAT 1.
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Against a 500m request. Higher than the usual 50-60% because restore and
+          # compaction are legitimately bursty here, and a low threshold turns a routine
+          # RocksDB compaction into a scale-up followed by a rebalance.
+          averageUtilization: 75
+
+    # Memory is NOT used as a scaling signal on purpose. A JVM's RSS rises to fill its heap
+    # and RocksDB's block cache fills to its configured size and then stays there; neither
+    # falls when load drops. A memory-target HPA on a JVM scales up once and never scales
+    # back down.
+
+  behavior:
+    scaleUp:
+      # 5 minutes of stabilisation: long enough for a previous scale-up's restore to finish
+      # and its effect on the metric to show, so the HPA reacts to the new steady state rather
+      # than to the disruption it just caused.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+      selectPolicy: Max
+    scaleDown:
+      # 15 minutes. Scale-down is the more expensive direction: the removed pod's partitions
+      # are redistributed and restored elsewhere, so a premature scale-down followed by a
+      # scale-up pays the restore cost twice.
+      stabilizationWindowSeconds: 900
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 600
+      selectPolicy: Min
+
+# ─────────────────────────────────────────────────────────────────────
+# The metric you actually want (CAVEAT 3), once prometheus-adapter or KEDA is available.
+# Scales on records of consumer lag per instance rather than on CPU:
+#
+#   metrics:
+#     - type: External
+#       external:
+#         metric:
+#           name: kafka_consumergroup_lag
+#           selector:
+#             matchLabels:
+#               consumergroup: ecommerce-streams-app
+#         target:
+#           type: AverageValue
+#           averageValue: "10000"
+#
+# With KEDA the same thing is a ScaledObject with the `kafka` trigger, which additionally
+# knows not to scale past the partition count for you.
+# ─────────────────────────────────────────────────────────────────────

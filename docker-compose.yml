@@ -262,3 +262,237 @@ services:
       KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
       KAFKA_CLUSTERS_0_KSQLDBSERVER: http://ksqldb-server:8088
       JAVA_OPTS: "-Xms128m -Xmx384m"
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  ADDED BY TASK A6 — application instances + observability.
+  #
+  #  Everything below is ADDITIVE. Nothing above this line was changed: the brokers,
+  #  Zookeeper, Schema Registry, ksqlDB and Kafka UI are byte-for-byte as they were.
+  #
+  #  ── MEMORY BUDGET (16 GB machine) ────────────────────────────────
+  #  Pre-existing:  zookeeper 256m heap (~0.4 GB RSS) + 3 x kafka 512m heap (~0.9 GB each,
+  #                 2.7 GB) + schema-registry 512m (~0.7 GB) + ksqldb 768m (~1.0 GB) +
+  #                 kafka-ui 384m (~0.6 GB)                                   ≈ 5.4 GB
+  #  Added here:    app-1 1.0 GB + app-2 1.0 GB                               ≈ 2.0 GB
+  #                 kafka-exporter 0.125 GB + prometheus 0.5 GB + grafana 0.375 GB ≈ 1.0 GB
+  #                                                                    ─────────────────
+  #                 TOTAL                                                     ≈ 8.4 GB
+  #
+  #  Every added service carries an explicit `mem_limit`, so the ceiling is enforced rather
+  #  than hoped for. 8.4 GB fits a 16 GB machine — but note that on macOS and Windows this
+  #  is bounded by the DOCKER DESKTOP VM's memory allocation, which commonly defaults to
+  #  8 GB. If containers start getting OOM-killed, raise Docker Desktop's memory to 12 GB
+  #  (Settings → Resources), or bring up the stack without the two app containers and run
+  #  the app on the host with `./gradlew bootRun` as before.
+  #
+  #  ── WHY TWO APP INSTANCES ────────────────────────────────────────
+  #  One instance owns all three `orders` partitions, so its state store holds all the data
+  #  and every query looks complete — which is precisely what hid the silent-partial-results
+  #  bug that commit 7a52ef7 fixed. Two instances split the partitions, which means the
+  #  Interactive Query fan-out, the peer discovery and the `partial`/`failures` fields are
+  #  actually EXERCISED by `docker compose up` rather than only in theory.
+  #
+  #  ── PORTS ADDED ──────────────────────────────────────────────────
+  #    8090  app-1        8091  app-2        9308  kafka-exporter
+  #    9091  Prometheus   (9090 is already taken by kafka-ui)
+  #    3000  Grafana
+  # ═══════════════════════════════════════════════════════════════════
+
+  # ─── Streams app instance 1 ───────────────────────────────────────
+  app-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ecommerce-kafka-streaming:local
+    hostname: app-1
+    container_name: app-1
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    ports:
+      - "8090:8090"
+    environment:
+      # In-network broker addresses (:29092-4), not the host-facing :9092-4 listeners.
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      SPRING_KAFKA_STREAMS_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      SERVER_PORT: 8090
+      # The address the OTHER instance uses to reach this one. `app-1` is the compose
+      # network alias, resolvable from app-2. NOT localhost — see the long note in
+      # KafkaStreamsConfig.java: inside a container `localhost` is that container, so the
+      # default would make each instance advertise itself as the other's loopback and the
+      # fan-out would silently query itself.
+      APP_STREAMS_APPLICATION_SERVER: app-1:8090
+      APP_STREAMS_STATE_DIR: /var/lib/kafka-streams
+      MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,metrics,prometheus
+      MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+      SERVER_SHUTDOWN: graceful
+      SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 30s
+      LOGGING_LEVEL_COM_ECOMMERCE_STREAMING: INFO
+    volumes:
+      # Named volume, not a bind mount: RocksDB does a lot of small writes and fsyncs, and
+      # bind-mounted host filesystems on macOS/Windows make that pathologically slow.
+      # Persisting it also means `compose restart` replays the changelog delta instead of
+      # rebuilding every store from the beginning of the topic.
+      - app1-state:/var/lib/kafka-streams
+    # Mirrors the Kubernetes container securityContext (readOnlyRootFilesystem: true) so a
+    # missing writable path is caught locally rather than on first deploy.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    healthcheck:
+      # Reads the BODY, not the status code. /api/analytics/streams/status answers 200 for
+      # every stream state by design, so a plain HTTP check would call a REBALANCING instance
+      # healthy. `queryable` is true only when KafkaStreams.State == RUNNING. Identical logic
+      # to the Kubernetes readiness probe in k8s/30-statefulset.yaml.
+      test: ["CMD-SHELL", "curl -sf --max-time 4 http://localhost:8090/api/analytics/streams/status | grep -q '\"queryable\":true'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    mem_limit: 1g
+    restart: unless-stopped
+
+  # ─── Streams app instance 2 ───────────────────────────────────────
+  # Same application-id (so the two form ONE Streams application and split the partitions),
+  # different port, different advertised address, different state volume.
+  app-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ecommerce-kafka-streaming:local
+    hostname: app-2
+    container_name: app-2
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    ports:
+      - "8091:8091"
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      SPRING_KAFKA_STREAMS_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      SERVER_PORT: 8091
+      APP_STREAMS_APPLICATION_SERVER: app-2:8091
+      APP_STREAMS_STATE_DIR: /var/lib/kafka-streams
+      MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,metrics,prometheus
+      MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+      SERVER_SHUTDOWN: graceful
+      SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 30s
+      LOGGING_LEVEL_COM_ECOMMERCE_STREAMING: INFO
+    volumes:
+      - app2-state:/var/lib/kafka-streams
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf --max-time 4 http://localhost:8091/api/analytics/streams/status | grep -q '\"queryable\":true'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    mem_limit: 1g
+    restart: unless-stopped
+
+  # ─── Kafka exporter (broker + consumer-group metrics for Prometheus) ───
+  # Chosen over the JMX exporter for one reason: CONSUMER GROUP LAG. Lag is the difference
+  # between a group's committed offset and the partition's log end offset — it lives in the
+  # broker's consumer-group protocol, not in a JMX MBean, so the JMX exporter cannot produce
+  # it at all. For a streaming application lag is THE health metric, so the exporter that
+  # reports it wins. (Add the JMX exporter alongside if you also want broker internals such
+  # as request queue time.)
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    hostname: kafka-exporter
+    container_name: kafka-exporter
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    ports:
+      - "9308:9308"
+    command:
+      - --kafka.server=kafka-1:29092
+      - --kafka.server=kafka-2:29093
+      - --kafka.server=kafka-3:29094
+      # Per-partition lag, not just per-topic totals. Costs cardinality but exposes SKEW —
+      # one hot partition among three is a third of the traffic and is invisible in a sum.
+      - --topic.filter=.*
+      - --group.filter=.*
+      - --web.listen-address=:9308
+    mem_limit: 128m
+    restart: unless-stopped
+
+  # ─── Prometheus ───────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    hostname: prometheus
+    container_name: prometheus
+    depends_on:
+      - kafka-exporter
+    ports:
+      # 9091 on the host: 9090 is already published by kafka-ui. Inside the network
+      # Prometheus still listens on the conventional 9090, which is what the Grafana
+      # datasource in monitoring/grafana/provisioning points at.
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 24h, not the 15-day default: this is a laptop stack and the TSDB is the one component
+      # here that grows without bound.
+      - --storage.tsdb.retention.time=24h
+      - --web.enable-lifecycle
+    mem_limit: 512m
+    restart: unless-stopped
+
+  # ─── Grafana ──────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.1.4
+    hostname: grafana
+    container_name: grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      # LOCAL DEVELOPMENT CREDENTIALS ONLY. This Grafana is bound to the loopback stack and
+      # holds no data of its own. Do not copy this block to anything reachable from a network
+      # you do not control.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Anonymous viewer access so the dashboard opens without a login prompt during a demo.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Land straight on the streaming dashboard instead of the empty Grafana home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/kafka-streams-analytics.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    mem_limit: 384m
+    restart: unless-stopped
+
+# ═════════════════════════════════════════════════════════════════════
+#  Named volumes (added by task A6).
+#
+#  app1-state / app2-state hold each instance's RocksDB tree. They are the compose analogue
+#  of the StatefulSet's volumeClaimTemplates, and they exist for the same reason: without
+#  them, every `compose down` throws away the materialised state and the next `up` replays
+#  every changelog topic from the beginning before either instance can answer a query.
+#
+#  `docker compose down` KEEPS them. `docker compose down -v` deletes them and forces that
+#  full restore — which is exactly how you test the restore path deliberately.
+# ═════════════════════════════════════════════════════════════════════
+volumes:
+  app1-state:
+  app2-state:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,91 @@
+# =====================================================================
+#  Alerting rules — the four things that actually page for a Kafka Streams application.
+#
+#  These are wired into Prometheus (rule_files in monitoring/prometheus.yml) but NOT into an
+#  Alertmanager: the local stack has no notification path, so they fire into Prometheus'
+#  /alerts page only. That is intentional — a laptop stack does not need a paging pipeline,
+#  and the rules are still useful there as a live "is anything wrong" panel, and as the
+#  starting point for the real cluster.
+#
+#  Thresholds are dev-scale. Re-tune them against a production baseline before relying on them.
+# =====================================================================
+groups:
+
+  - name: kafka-streams-lag
+    interval: 30s
+    rules:
+
+      # THE signal. Lag is the difference between what has been produced and what the group
+      # has committed; sustained growth means the application cannot keep up, and every
+      # downstream number (fraud alerts, category sales) is that far behind reality.
+      #
+      # `for: 5m` because lag is spiky by nature: every commit interval, every rebalance and
+      # every batch of simulated orders produces a transient spike that is not a problem.
+      # What is a problem is lag that does not come back down.
+      - alert: KafkaConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 50000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer group {{ $labels.consumergroup }} is {{ $value | humanize }} records behind on {{ $labels.topic }}"
+          description: >-
+            Sustained lag. Check whether the instances are RUNNING
+            (GET /api/analytics/streams/status), whether a rebalance is stuck, and whether
+            the partition count is limiting parallelism (3 partitions == 3 useful instances).
+
+      # Lag that is monotonically increasing is worse than lag that is merely large: large-
+      # but-flat means "behind but keeping up", growing means "will never catch up".
+      - alert: KafkaConsumerLagGrowing
+        expr: |
+          sum by (consumergroup) (deriv(kafka_consumergroup_lag[10m])) > 100
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Consumer group {{ $labels.consumergroup }} lag is growing, not draining"
+          description: "Lag has been increasing for 10 minutes. The application is not keeping up with the input rate."
+
+  - name: kafka-streams-health
+    interval: 30s
+    rules:
+
+      # Under-replicated partitions break the EXACTLY_ONCE_V2 guarantee's foundations: with
+      # min.insync.replicas=2, dropping below 2 in-sync replicas makes the broker REFUSE
+      # writes rather than accept them under-replicated. Producers start failing.
+      - alert: KafkaUnderReplicatedPartitions
+        expr: sum(kafka_topic_partition_under_replicated_partition) > 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} under-replicated partition(s)"
+          description: "A broker is down or lagging. With min.insync.replicas=2, a second failure stops writes entirely."
+
+      # A Streams instance that has left RUNNING is not serving Interactive Queries: the REST
+      # API answers 503 and any fan-out that reaches it comes back partial:true.
+      #
+      # NOTE: this rule depends on the `kafka_stream_state` gauge from Micrometer, which only
+      # exists once micrometer-registry-prometheus is on the classpath. Until then it silently
+      # evaluates to no series (never fires) rather than erroring.
+      - alert: KafkaStreamsNotRunning
+        expr: kafka_stream_state != 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Streams instance {{ $labels.instance }} is not in RUNNING state"
+          description: >-
+            KafkaStreams.State ordinal is {{ $value }} (2 == RUNNING). Brief excursions during
+            a rebalance are normal; five minutes is not.
+
+      - alert: StreamsAppDown
+        expr: up{job="ecommerce-streams"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Streams instance {{ $labels.instance }} is not scrapeable"
+          description: >-
+            Either the instance is down, or micrometer-registry-prometheus is missing from the
+            classpath and /actuator/prometheus is returning 404. Check which before paging.

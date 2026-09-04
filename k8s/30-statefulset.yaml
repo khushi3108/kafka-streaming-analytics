@@ -1,0 +1,343 @@
+# =====================================================================
+#  StatefulSet — the Kafka Streams analytics application.
+#
+#  WHY A STATEFULSET AND NOT A DEPLOYMENT
+#  --------------------------------------
+#  Two independent reasons, either of which alone is decisive:
+#
+#  1. DISK. Every state store in OrderStreamTopology is materialised in RocksDB on local
+#     disk under `app.streams.state-dir`. That directory is not a cache: it is a
+#     materialised view of the changelog topics. A Deployment gives each replacement pod a
+#     fresh empty filesystem, so every restart, every rescheduling and every rolling update
+#     would trigger a FULL changelog replay before the instance could serve a single query.
+#     With the customer-spending store holding lifetime totals, that replay grows without
+#     bound over the life of the application. A StatefulSet's volumeClaimTemplates bind pod
+#     `ecommerce-streams-N` to PVC `state-ecommerce-streams-N` permanently, so a restarted
+#     pod re-attaches its own RocksDB tree and only replays the delta.
+#
+#  2. IDENTITY. Interactive Queries need each instance to advertise a peer-reachable address
+#     (see the env block below). A Deployment's pod names are random, so the advertised
+#     address would change on every restart, and — because KafkaStreamsConfig.java derives
+#     the state directory leaf from that address — so would the on-disk path, defeating
+#     reason 1 even if the volume survived.
+#
+#  REPLICAS AND PARTITION COUNT
+#  ----------------------------
+#  The `orders` topic has 3 partitions (docker/kafka-init.sh). A Kafka Streams instance can
+#  only be assigned whole partitions, so instance number 4 and beyond would sit idle holding
+#  no tasks while still consuming a pod's worth of memory and still being fanned out to.
+#  2 replicas here, 3 is the hard ceiling — which is why the HPA's maxReplicas is 3.
+# =====================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ecommerce-streams
+  namespace: kafka-analytics
+  labels:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+    app.kubernetes.io/part-of: ecommerce-kafka-streaming
+spec:
+  # Must match the headless Service name — this is what gives pods their per-pod DNS.
+  serviceName: ecommerce-streams-headless
+  replicas: 2
+
+  # Parallel, not the default OrderedReady. With OrderedReady, pod-1 is not created until
+  # pod-0 reports READY, and readiness here means "Kafka Streams reached RUNNING". On a cold
+  # start pod-0 has to restore its whole state before pod-1 even begins — and then pod-1
+  # joining triggers the rebalance anyway. Parallel brings them up together so the group
+  # stabilises in ONE rebalance instead of a serialised chain of them.
+  podManagementPolicy: Parallel
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Rolls the highest ordinal first, one pod at a time, waiting for READY in between.
+      # Combined with the readiness probe below, "in between" means "until the new pod has
+      # actually finished restoring state and is RUNNING" — not merely "the JVM started".
+      partition: 0
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ecommerce-streams
+      app.kubernetes.io/component: streams-app
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ecommerce-streams
+        app.kubernetes.io/component: streams-app
+        app.kubernetes.io/part-of: ecommerce-kafka-streaming
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8090"
+    spec:
+      # ── Shutdown budget ────────────────────────────────────────────
+      # 120s = 15s preStop drain + up to 45s of Spring graceful shutdown (in-flight HTTP and
+      # the fan-out RPCs it may be blocked on) + KafkaStreams.close(), which has to commit the
+      # open EOS transaction, flush RocksDB and leave the consumer group cleanly.
+      #
+      # Leaving the group cleanly is the point. SIGKILL at 30s (the default) leaves the
+      # instance's tasks orphaned until the group's session timeout expires, and until then
+      # NOBODY owns those partitions — the surviving pods keep answering `partial: true` and
+      # the dead pod's partitions make no progress at all. The cost of the extra 90s is
+      # nothing; the cost of getting it wrong is a stall on every deploy.
+      terminationGracePeriodSeconds: 120
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # fsGroup makes the kubelet chown the PVC to gid 10001 on mount. Without it the
+        # non-root user cannot write to a freshly provisioned volume and RocksDB fails to open.
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      affinity:
+        podAntiAffinity:
+          # `preferred`, not `required`: on a single-node dev cluster (kind, minikube, Docker
+          # Desktop) a hard requirement would leave the second pod Pending forever with no
+          # explanation more useful than "0/1 nodes available". On a real multi-node cluster
+          # the scheduler honours the preference and spreads the instances, so one node loss
+          # takes out one shard rather than the whole application.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ecommerce-streams
+                    app.kubernetes.io/component: streams-app
+
+      containers:
+        - name: streams-app
+          # IMMUTABLE TAG. CI (.github/workflows/ci.yml) tags every image with the git SHA and
+          # never with :latest — a mutable tag makes "which code is running in this pod?"
+          # unanswerable and makes a rollback a guess. Replace the digest/SHA below at deploy
+          # time (kustomize edit set image, Helm value, or your CD tool's image updater).
+          image: ghcr.io/OWNER/kafka-streaming-analytics:REPLACE_WITH_GIT_SHA
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8090
+              protocol: TCP
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Per-pod identity and the Interactive Query address ─────
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+            # Literal, defined BEFORE it is referenced — Kubernetes' $(VAR) expansion only
+            # sees variables declared earlier in this same list.
+            - name: HEADLESS_SERVICE
+              value: "ecommerce-streams-headless"
+
+            # ─────────────────────────────────────────────────────────
+            #  THE ONE THAT MATTERS.
+            #
+            #  `app.streams.application-server` is the address this instance publishes into
+            #  the consumer-group metadata; it is how every OTHER instance finds it, and it is
+            #  the sole discovery mechanism behind the whole multi-instance query story.
+            #
+            #  The application default is `localhost:${server.port}`, which is correct for two
+            #  JVMs on one laptop and CATASTROPHIC in Kubernetes. Inside a pod, `localhost`
+            #  resolves to that pod. So every instance would advertise "localhost:8090",
+            #  every instance would read that as its own loopback, and the fan-out would query
+            #  itself N times, returning one shard's data N times over — with HTTP 200 and no
+            #  indication anything was missing. That is the exact silent-partial-results class
+            #  of bug commit 7a52ef7 exists to eliminate, reintroduced by deployment config.
+            #
+            #  The pod's own StatefulSet DNS name is used rather than $(POD_IP) because it
+            #  survives a pod restart. The IP does not: after a restart the peers hold a stale
+            #  IP in group metadata until the next rebalance, and the RocksDB directory
+            #  (derived from this string in KafkaStreamsConfig.java) would change name on
+            #  every restart, orphaning the restored state on the PVC.
+            #
+            #  This resolves because the headless Service sets publishNotReadyAddresses: true;
+            #  see 20-service-headless.yaml.
+            # ─────────────────────────────────────────────────────────
+            - name: APP_STREAMS_APPLICATION_SERVER
+              value: "$(POD_NAME).$(HEADLESS_SERVICE).$(POD_NAMESPACE).svc.cluster.local:8090"
+
+            # Surface the pod identity in logs/metrics without touching application code.
+            - name: MANAGEMENT_METRICS_TAGS_INSTANCE
+              value: "$(POD_NAME)"
+
+          envFrom:
+            - configMapRef:
+                name: ecommerce-streams-config
+            - secretRef:
+                name: ecommerce-streams-credentials
+                # optional: the Secret's contents are inert until the Java change described in
+                # 10-secret.yaml lands, so a missing Secret must not block a deploy.
+                optional: true
+
+          # ── Probes ─────────────────────────────────────────────────
+          #
+          # STARTUP: gates the other two. A cold pod with an empty PVC has to restore its
+          # state stores from the changelog topics before it is any use, and how long that
+          # takes depends on how much history there is — not on anything we can predict here.
+          # 30 x 10s = 5 minutes of grace; raise failureThreshold, never periodSeconds, if a
+          # large restore needs longer. It probes LIVENESS (is the context up), not readiness,
+          # because "still restoring" is a legitimate startup state, not a failure.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+
+          # LIVENESS: deliberately the narrowest possible check — Spring's `livenessState`,
+          # which reflects only "the application context is running". It must NOT depend on
+          # Kafka. If liveness went red whenever the brokers were unreachable, a broker
+          # outage would restart every pod in a loop, throwing away restored RocksDB state
+          # and guaranteeing the recovery takes longer than the outage did. Restart the pod
+          # only when the pod itself is broken.
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+
+          # READINESS: must reflect the STREAM state, not the JVM.
+          #
+          # Why exec and not httpGet:
+          #   - /actuator/health/readiness today resolves to Spring's `readinessState` alone,
+          #     which flips to ACCEPTING_TRAFFIC as soon as the context starts. It knows
+          #     nothing about Kafka Streams, so it would call a REBALANCING pod ready.
+          #   - /api/analytics/streams/status DOES know — but it answers 200 for EVERY state
+          #     by explicit design (it is the endpoint you call to find out why the query
+          #     endpoints are 503-ing, so it must never 503 itself). An httpGet probe only
+          #     looks at the status code, so it would also call a REBALANCING pod ready.
+          #
+          # So the probe reads the BODY. `queryable` is true if and only if
+          # KafkaStreams.State == RUNNING, which is exactly the condition under which this pod
+          # can serve Interactive Queries. A pod that is CREATED, REBALANCING, PENDING_SHUTDOWN
+          # or ERROR is pulled out of the client Service's endpoints and stops receiving
+          # traffic, while the headless Service keeps it resolvable for its peers.
+          #
+          # This is the interim solution. The cleaner one is a KafkaStreams HealthIndicator
+          # bean plus a readiness health group — that needs a Java change this task does not
+          # own. The exact change is written up in k8s/README.md; when it lands, replace this
+          # block with an httpGet on /actuator/health/readiness and drop curl from the image.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - >-
+                  curl -sf --max-time 4 http://127.0.0.1:8090/api/analytics/streams/status
+                  | grep -q '"queryable":true'
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 6
+            successThreshold: 1
+            # 3 x 10s: a routine rebalance is usually seconds, so this pulls a genuinely
+            # unavailable pod quickly without flapping on every partition reassignment.
+            failureThreshold: 3
+
+          # ── Shutdown ───────────────────────────────────────────────
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal is ASYNCHRONOUS and races SIGTERM: the kubelet sends the
+                # signal at the same time the endpoints controller starts telling kube-proxy
+                # and every peer's cached DNS that this pod is gone. Without this pause the
+                # pod stops accepting connections while requests are still being routed to
+                # it, and each one surfaces as a fan-out FAILURE (`partial: true`) on a
+                # sibling pod rather than as a clean redirect. 15s is comfortably longer than
+                # propagation takes and is charged against the 120s grace period above.
+                command: ["/bin/sh", "-c", "sleep 15"]
+
+          # ── Resources ──────────────────────────────────────────────
+          # Sized for the JVM in the image, which runs -XX:MaxRAMPercentage=60. Against the
+          # 2Gi limit that is a ~1.2Gi heap, leaving ~800Mi for the things that are NOT on the
+          # heap and that a naive 75%/-Xmx sizing forgets:
+          #   - RocksDB block cache, memtables, index and filter blocks (off-heap, one set per
+          #     state store per partition — this topology has five stores),
+          #   - the 10MB Streams record cache,
+          #   - metaspace, code cache, thread stacks (2 stream threads + Tomcat + the
+          #     fan-out executor).
+          # requests are set below limits on CPU (burstable) but memory request == limit, so
+          # the pod gets the Guaranteed-like memory behaviour that a stateful process wants:
+          # memory here is not compressible, and an evicted pod is a lost RocksDB cache.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              # No CPU-limit throttling headroom problem: restore and rebalance are bursty and
+              # CPU-bound, and throttling them at the request would make every restart slower.
+              cpu: "2000m"
+              memory: "2Gi"
+              ephemeral-storage: "2Gi"
+
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/kafka-streams
+            # The container runs with readOnlyRootFilesystem: true, so every path the JVM
+            # writes to must be mounted. /tmp is where java.io.tmpdir, the Tomcat work
+            # directory and any JFR/heap-dump output go.
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            # Node-disk backed, NOT medium: Memory. A tmpfs emptyDir is charged against the
+            # pod's MEMORY limit, so a 256Mi tmpfs would quietly take 256Mi away from the 2Gi
+            # the JVM and RocksDB were sized against and turn a heap dump into an OOMKill.
+            sizeLimit: 512Mi
+
+  # ── Persistent state ─────────────────────────────────────────────────
+  # One PVC per pod, named `state-ecommerce-streams-<ordinal>`, bound for the life of that
+  # ordinal. This is the whole reason for choosing a StatefulSet.
+  #
+  # NOTE ON DELETION: Kubernetes does NOT delete these PVCs when the StatefulSet is deleted
+  # or when it is scaled down (unless persistentVolumeClaimRetentionPolicy says otherwise —
+  # deliberately not set here). That default is what you want: scaling from 3 back to 2 and
+  # then to 3 again re-attaches the original state instead of forcing a full restore. It also
+  # means `kubectl delete -f k8s/` leaves the volumes behind; see k8s/README.md → Teardown.
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+        labels:
+          app.kubernetes.io/name: ecommerce-streams
+          app.kubernetes.io/component: streams-state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName is intentionally omitted so the cluster's default class is used.
+        # On a real cluster, pin an SSD-backed class: RocksDB compaction and changelog restore
+        # are I/O bound and a network HDD class turns a 30-second restore into minutes.
+        #   storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 10Gi

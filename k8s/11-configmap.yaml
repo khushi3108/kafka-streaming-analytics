@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------------
+# ConfigMap — non-secret application configuration.
+#
+# Everything here is delivered as ENVIRONMENT VARIABLES (envFrom in the StatefulSet), not as a
+# mounted application.yml. Two reasons:
+#
+#   1. src/main/resources/application.yml is owned by the application, not by this directory.
+#     Overlaying a second copy would fork it, and the fork would rot.
+#   2. Spring Boot's relaxed binding resolves `app.streams.state-dir` from
+#     `APP_STREAMS_STATE_DIR`, including for the plain `@Value` lookups in
+#     KafkaStreamsConfig.java (SystemEnvironmentPropertySource translates dots and hyphens to
+#     underscores before it looks the name up). So every key below overrides exactly one
+#     documented property, with no duplicated YAML.
+#
+# NOTE: `app.streams.application-server` is deliberately NOT here. It is per-pod and is
+# composed from the downward API in 30-statefulset.yaml. Setting it to one fixed value for all
+# pods would be the exact bug the application's own comments warn about.
+# ---------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-streams-config
+  namespace: kafka-analytics
+  labels:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+data:
+  # ── Kafka connectivity ─────────────────────────────────────────────
+  # All brokers listed so a client can still bootstrap when any one is down. Point these at
+  # your in-cluster Kafka Service (Strimzi: `<cluster>-kafka-bootstrap.<ns>.svc:9092`).
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka-bootstrap.kafka.svc.cluster.local:9092"
+  SPRING_KAFKA_STREAMS_BOOTSTRAP_SERVERS: "kafka-bootstrap.kafka.svc.cluster.local:9092"
+
+  # The application-id is the group identity that ties the instances together. It MUST be
+  # identical on every pod — that is what makes them one Streams application rather than N
+  # independent ones each consuming the whole topic.
+  SPRING_KAFKA_STREAMS_APPLICATION_ID: "ecommerce-streams-app"
+
+  # ── State ──────────────────────────────────────────────────────────
+  # The mount point of the PersistentVolumeClaim. KafkaStreamsConfig.java appends
+  # "/<host>-<port>" to this, so the real RocksDB tree lives at e.g.
+  #   /var/lib/kafka-streams/ecommerce-streams-0.ecommerce-streams-headless.kafka-analytics.svc.cluster.local-8090
+  # That leaf is stable for a given pod because a StatefulSet pod name is stable.
+  APP_STREAMS_STATE_DIR: "/var/lib/kafka-streams"
+
+  # ── Interactive Query peer RPC ─────────────────────────────────────
+  # Pod-to-pod, inside the cluster, so plain http. Timeouts kept as the application defaults;
+  # they are what turn "one sick pod" into a `partial: true` response instead of a hang.
+  APP_STREAMS_RPC_SCHEME: "http"
+  APP_STREAMS_RPC_CONNECT_TIMEOUT_MS: "1000"
+  APP_STREAMS_RPC_READ_TIMEOUT_MS: "3000"
+  APP_STREAMS_RPC_FAN_OUT_TIMEOUT_MS: "5000"
+
+  # ── HTTP server + graceful shutdown ────────────────────────────────
+  SERVER_PORT: "8090"
+
+  # server.shutdown=graceful — on SIGTERM, Tomcat stops accepting new connections and lets
+  # in-flight requests finish instead of severing them. Paired with the preStop hook and
+  # terminationGracePeriodSeconds in the StatefulSet: a hard kill mid-rebalance strands the
+  # instance's tasks until the group's session timeout expires, which stalls EVERY partition
+  # it owned, not just the request that was in flight.
+  SERVER_SHUTDOWN: "graceful"
+  SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: "45s"
+
+  # ── Actuator ───────────────────────────────────────────────────────
+  # `prometheus` is included here, but the endpoint only MATERIALISES if
+  # micrometer-registry-prometheus is on the classpath — it is not today.
+  # See k8s/README.md → "Handed back to the application owners". Listing a non-existent
+  # endpoint in the exposure list is harmless (it is a filter, not an assertion), so this key
+  # is safe to ship ahead of the dependency.
+  MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,metrics,prometheus"
+
+  # Creates the `liveness` and `readiness` health GROUPS at /actuator/health/{liveness,readiness}.
+  # Without this they only appear when Boot auto-detects Kubernetes, which it does by sniffing
+  # for *_SERVICE_HOST env vars — too implicit to depend on for something probes hang off.
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  MANAGEMENT_ENDPOINT_HEALTH_SHOW_DETAILS: "always"
+
+  # Deliberately NOT set:
+  #   MANAGEMENT_ENDPOINT_HEALTH_GROUP_READINESS_INCLUDE: "readinessState,kafkaStreams"
+  # There is no `kafkaStreams` health contributor in this application yet, and Boot's
+  # group-membership validation FAILS STARTUP when a group names a contributor that does not
+  # exist. Once the health indicator described in k8s/README.md is added, uncomment it and
+  # switch the readiness probe from exec to httpGet.
+
+  # ── Logging ────────────────────────────────────────────────────────
+  # DEBUG on the app package is a local-development setting; in a cluster it is noise and cost.
+  LOGGING_LEVEL_ROOT: "INFO"
+  LOGGING_LEVEL_COM_ECOMMERCE_STREAMING: "INFO"
+  LOGGING_LEVEL_ORG_APACHE_KAFKA_STREAMS: "WARN"
+  LOGGING_LEVEL_ORG_APACHE_KAFKA_CLIENTS: "WARN"

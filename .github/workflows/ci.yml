@@ -1,0 +1,335 @@
+# =====================================================================
+#  CI — build, test, containerise, scan.
+#
+#  Job graph:
+#
+#      build ──┬──> image ──> (push to GHCR, main only)
+#              └──> integration-test   [gated: see the `if` on that job]
+#
+#  DESIGN NOTES
+#
+#  * IMMUTABLE TAGS ONLY. Every image is tagged with the full git SHA and, on main, with a
+#    `main-<short-sha>` alias. There is no `:latest` anywhere in this file, deliberately.
+#    A mutable tag makes "which commit is running in this pod?" unanswerable, makes a
+#    rollback a guess, and makes the Trivy result on a tag meaningless the moment someone
+#    else pushes to it. k8s/30-statefulset.yaml expects a SHA tag for the same reason.
+#
+#  * UNIT vs INTEGRATION are separate jobs on purpose. `./gradlew build` runs the fast,
+#    hermetic tests (build.gradle.kts excludes @Tag("integration") from `test`).
+#    `./gradlew integrationTest` starts a real Kafka via Testcontainers, takes minutes, and
+#    is gated so it does not sit on the critical path of every trivial PR.
+#    Docker IS available on GitHub-hosted runners, so the gate is about time, not capability.
+#
+#  * The image build compiles the application AGAIN inside the Dockerfile rather than
+#    copying the jar from the build job. That is intentional: the image is then reproducible
+#    from the repo alone, with no dependency on an artifact-passing step that can silently
+#    ship a stale jar. Buildx's GHA layer cache keeps the cost down.
+# =====================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      run_integration_tests:
+        description: "Run the Testcontainers integration tests"
+        type: boolean
+        default: false
+
+# Cancel superseded runs on the same branch/PR — a PR that gets three pushes in a minute
+# should not occupy three runners building the same image three times.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; individual jobs widen it where they must.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  JAVA_VERSION: "21"
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  1. Build + unit tests
+  # ═══════════════════════════════════════════════════════════════════
+  build:
+    name: Build & unit tests (JDK 21)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          # Set explicitly rather than relying on the Gradle toolchain to PROVISION a JDK.
+          # build.gradle.kts declares a Java 21 toolchain; if the runner's JDK matched
+          # nothing, Gradle would silently download one and add minutes to every build.
+          check-latest: false
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Only write the dependency/build cache from the default branch. PR branches read
+          # it but cannot poison it — a PR that adds a dependency should not change what
+          # every other PR resolves.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+          validate-wrappers: true
+
+      - name: Build and run unit tests
+        # `build` = compile + test + bootJar. @Tag("integration") tests are excluded by the
+        # `tasks.test { useJUnitPlatform { excludeTags("integration") } }` block in
+        # build.gradle.kts, so this job needs no Docker daemon and stays fast.
+        run: ./gradlew --no-daemon build
+
+      - name: Upload test reports
+        # always(): the report is at its most useful precisely when the step above failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            build/reports/tests/test
+            build/test-results/test
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload boot jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-jar-${{ github.sha }}
+          path: build/libs/*.jar
+          retention-days: 7
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  2. Container image + vulnerability scan
+  # ═══════════════════════════════════════════════════════════════════
+  image:
+    name: Image build & Trivy scan
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    permissions:
+      contents: read
+      packages: write          # push to GHCR (main only, see the push step's `if`)
+      security-events: write   # upload the Trivy SARIF to the Security tab
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GHCR requires a lowercase repository path; github.repository preserves the owner's
+      # original casing, so `Owner/Repo` would be rejected at push time with an unhelpful
+      # error. Normalise once, here.
+      - name: Compute image reference
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=${IMAGE}"                      >> "$GITHUB_OUTPUT"
+          echo "tag_sha=${IMAGE}:${GITHUB_SHA}"      >> "$GITHUB_OUTPUT"
+          echo "tag_short=${IMAGE}:sha-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        # Only when we will actually push. PRs from forks have no write token anyway, and
+        # logging in on a PR would fail the job for no benefit.
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (load locally for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # load, not push: the image must be scanned BEFORE it is published. Pushing first
+          # and scanning after means a vulnerable image was available to pull, however
+          # briefly, and that a failing scan does not undo anything.
+          load: true
+          push: false
+          tags: |
+            ${{ steps.meta.outputs.tag_sha }}
+            ${{ steps.meta.outputs.tag_short }}
+          # Layer cache across runs. The Dockerfile is ordered so the Gradle dependency layer
+          # only rebuilds when build.gradle.kts changes.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      # ── Filesystem scan: dependencies as declared in the repo ──────
+      # Catches a vulnerable library the moment it is declared, with the Gradle coordinates
+      # attached — far more actionable than seeing it later as a jar inside a layer.
+      - name: Trivy — repository / dependency scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          # Report only; the gating decision is made on the IMAGE scan below, so a noisy
+          # transitive advisory does not block a PR that did not introduce it.
+          exit-code: "0"
+
+      - name: Upload dependency scan to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      # ── Image scan: what actually ships ────────────────────────────
+      - name: Trivy — container image scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.meta.outputs.tag_sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"        # this pass only produces the report
+
+      - name: Upload image scan to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Trivy — container image scan (gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.meta.outputs.tag_sha }}
+          format: table
+          # ignore-unfixed: a CRITICAL with no available patch cannot be acted on by this
+          # repo. Failing on it only teaches people to ignore the gate. It is still recorded
+          # in the SARIF above, so it is visible without being a blocker.
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: "1"        # THIS is the gate: a fixable CRITICAL/HIGH fails the build.
+
+      # ── Publish (default branch only, and only after the gate passed) ──
+      - name: Push image
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Immutable, SHA-derived tags only. No `:latest`.
+          tags: |
+            ${{ steps.meta.outputs.tag_sha }}
+            ${{ steps.meta.outputs.tag_short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Deployment hint
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        run: |
+          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tag_sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy with:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```sh' >> "$GITHUB_STEP_SUMMARY"
+          echo "kubectl -n kafka-analytics set image statefulset/ecommerce-streams \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  streams-app=${{ steps.meta.outputs.tag_sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  3. Integration tests (Testcontainers + a real Kafka broker)
+  # ═══════════════════════════════════════════════════════════════════
+  #
+  #  GATED, not disabled. It runs when:
+  #    * pushing to the default branch (so main is always verified end to end), or
+  #    * a PR carries the `integration-tests` label (opt in per PR), or
+  #    * someone dispatches the workflow with the input ticked.
+  #
+  #  Why gate it at all: these tests pull the Kafka image and start a broker per test class.
+  #  That is minutes, not seconds, and most PRs (a manifest tweak, a docs fix) cannot
+  #  possibly affect the topology. Gating keeps the feedback loop on ordinary PRs short
+  #  while guaranteeing the default branch is never merged into without a full run.
+  #
+  #  Docker IS available on GitHub-hosted Ubuntu runners, so Testcontainers works out of the
+  #  box with no service containers or extra setup.
+  # ═══════════════════════════════════════════════════════════════════
+  integration-test:
+    name: Integration tests (Testcontainers)
+    needs: build
+    if: >-
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-tests')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_integration_tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
+
+      - name: Verify Docker is available to Testcontainers
+        # The integration tests are annotated @Testcontainers(disabledWithoutDocker = true),
+        # so a missing daemon would make them SKIP — a green build that tested nothing.
+        # Fail loudly instead.
+        run: docker info > /dev/null
+
+      - name: Pre-pull Kafka image (best effort)
+        # Outside the test timeout, so a slow registry shows up as a slow step rather than as
+        # a mysterious Testcontainers startup timeout.
+        #
+        # continue-on-error because the tag is a GUESS: it matches the broker version in
+        # docker-compose.yml, but the integration tests choose their own image and may pin a
+        # different one. A wrong guess should cost a warm cache, never a red build —
+        # Testcontainers pulls whatever it actually needs regardless.
+        continue-on-error: true
+        run: docker pull confluentinc/cp-kafka:7.5.0
+
+      - name: Run integration tests
+        run: ./gradlew --no-daemon integrationTest
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: |
+            build/reports/tests/integrationTest
+            build/test-results/integrationTest
+          retention-days: 7
+          if-no-files-found: warn

@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------
+# Client-facing Service — the address dashboards, gateways and Ingresses use.
+#
+# In contrast to the headless Service, this one DOES load-balance, and that is correct:
+# any RUNNING instance can answer any query, because InteractiveQueryService fans the request
+# out to the peers that own the other partitions and merges the results. The caller does not
+# need to care which pod it lands on.
+#
+# It also keeps the DEFAULT publishNotReadyAddresses (false) on purpose. A pod that is
+# rebalancing or restoring must not receive client traffic — it would answer 503 (see
+# ApiExceptionHandler) or, for a fan-out, contribute a failure and force `partial: true`.
+# The peer Service relaxes readiness; this one must not.
+# ---------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-streams
+  namespace: kafka-analytics
+  labels:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+  annotations:
+    # Scrape hints for a Prometheus running with the classic kubernetes_sd annotation
+    # relabelling. If you use the Prometheus Operator instead, delete these and apply a
+    # ServiceMonitor selecting the same labels — the port name `http` is what it targets.
+    # Either way this only produces data once micrometer-registry-prometheus is on the
+    # classpath (see k8s/README.md).
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/actuator/prometheus"
+    prometheus.io/port: "8090"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  # Client fan-out queries are stateless with respect to which pod serves them, so plain
+  # round-robin is right. Do NOT set sessionAffinity here hoping to "stick" a client to the
+  # shard that owns its key — the shard mapping is per KEY, not per client, and the app
+  # already handles the routing internally.
+  sessionAffinity: None

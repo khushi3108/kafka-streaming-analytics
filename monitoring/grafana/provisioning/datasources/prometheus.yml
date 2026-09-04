@@ -1,0 +1,26 @@
+# ---------------------------------------------------------------------
+# Grafana datasource provisioning.
+#
+# Provisioned from a file rather than clicked in the UI so that a `docker compose down -v`
+# followed by `up` gives back an identical, working Grafana with no manual steps — and so the
+# dashboard JSON in ../../dashboards can reference the datasource by a STABLE uid.
+# ---------------------------------------------------------------------
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Container-network address. Prometheus publishes on host port 9091 (9090 is already taken
+    # by kafka-ui in docker-compose.yml) but still listens on 9090 inside the network.
+    url: http://prometheus:9090
+    isDefault: true
+    # Fixed uid: the dashboard JSON hard-codes this. A generated uid would change on every
+    # provision and every panel would render "Datasource not found".
+    uid: prometheus
+    editable: false
+    jsonData:
+      # Must be >= the scrape_interval in monitoring/prometheus.yml, otherwise Grafana asks
+      # for a finer step than Prometheus has data for and rate() windows come back empty.
+      timeInterval: "15s"
+      httpMethod: POST

@@ -1,0 +1,97 @@
+# =====================================================================
+#  Prometheus scrape configuration for the local (docker-compose) stack.
+#
+#  Three sources, and they answer different questions:
+#
+#    kafka-exporter   — the BROKER's view. Consumer group lag, partition offsets, ISR,
+#                       under-replicated partitions. This is the authoritative source for
+#                       "is the application falling behind?", because it compares the group's
+#                       committed offset against the log end offset AT THE BROKER. It works
+#                       whether or not the app is instrumented, and it keeps working when the
+#                       app is down — which is exactly when you most want the number.
+#
+#    ecommerce-streams — the APPLICATION's view. Kafka Streams thread state, process/commit
+#                       rates, task counts, RocksDB gauges, JVM. Comes from Micrometer via
+#                       /actuator/prometheus.
+#
+#                       ⚠️  This job produces NOTHING until `micrometer-registry-prometheus`
+#                       is added to build.gradle.kts. That file is owned by another agent, so
+#                       the dependency is REPORTED rather than added here; see k8s/README.md
+#                       → "Handed back to the application owners". Until then this job shows
+#                       as DOWN in Prometheus' /targets with a 404, which is the honest
+#                       signal — the alternative (omitting the job) would hide the gap.
+#
+#    prometheus       — self-scrape, so the monitoring layer is not a blind spot.
+#
+#  Retention and cardinality are deliberately modest: this is a laptop stack sharing 16 GB
+#  with three Kafka brokers, ksqlDB and Schema Registry.
+# =====================================================================
+
+global:
+  # 15s over 5s: three brokers plus two app instances at 5s produces a lot of samples for a
+  # local stack, and nothing here changes meaningfully faster than 15s.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    cluster: local-compose
+    env: dev
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+
+  # ─── Prometheus itself ─────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          component: monitoring
+
+  # ─── Kafka brokers, via kafka-exporter ─────────────────────────────
+  # kafka-exporter connects to the brokers as a client and turns the admin/consumer-group
+  # protocol into metrics. Chosen over the JMX exporter for the metric that matters most:
+  # CONSUMER GROUP LAG. The JMX exporter reports per-broker JMX MBeans and has no view of a
+  # consumer group's committed offsets at all, so it cannot produce lag — the single most
+  # important number for a streaming application. (JMX exporter is still the right tool for
+  # broker internals like request queue time and log flush latency; add it alongside, not
+  # instead.)
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+        labels:
+          component: kafka-broker
+    metric_relabel_configs:
+      # kafka-exporter emits one series per (topic, partition) for several metrics. With
+      # ksqlDB's internal topics and the Streams changelog/repartition topics, the __consumer
+      # internal topics add cardinality that is never looked at on a laptop.
+      - source_labels: [topic]
+        regex: "__consumer_offsets|__transaction_state"
+        action: drop
+
+  # ─── The Streams application ───────────────────────────────────────
+  # Two instances on distinct ports so multi-instance Interactive Queries can be exercised
+  # locally (see docker-compose.yml). They are listed statically because compose has no
+  # service discovery worth the complexity at this size; in Kubernetes this job is replaced
+  # by kubernetes_sd_configs (or a ServiceMonitor) selecting the pod annotations set in
+  # k8s/30-statefulset.yaml.
+  - job_name: ecommerce-streams
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["app-1:8090"]
+        labels:
+          component: streams-app
+          instance_name: app-1
+      - targets: ["app-2:8091"]
+        labels:
+          component: streams-app
+          instance_name: app-2
+    metric_relabel_configs:
+      # Kafka Streams tags most metrics with a client-id that embeds a UUID regenerated on
+      # every restart. Left alone, every restart orphans the old series and the dashboard's
+      # lines break in half. Strip the UUID suffix down to the stable application-id prefix.
+      - source_labels: [client_id]
+        regex: "(.*)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(-.*)?"
+        target_label: client_id
+        replacement: "${1}${2}"

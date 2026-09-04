@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------
+# HEADLESS Service — stable per-pod DNS. This is the load-bearing object for Interactive
+# Queries; without it the multi-instance query fan-out cannot work at all.
+#
+# WHY HEADLESS (clusterIP: None):
+#   A normal ClusterIP Service gives you ONE virtual IP that load-balances to a random pod.
+#   That is precisely wrong for Interactive Queries. A state store is sharded by partition, so
+#   when instance A discovers that customer "C-42" lives on instance B, it must reach
+#   *exactly* B — not "some pod in the set". A ClusterIP would round-robin the RPC to an
+#   arbitrary pod, which would answer `found:false` (it does not own that key) or, worse,
+#   bounce the request back to A.
+#
+#   clusterIP: None makes DNS return the pod A records instead of a VIP, and because the
+#   owning object is a StatefulSet each pod additionally gets its own name:
+#       ecommerce-streams-0.ecommerce-streams-headless.kafka-analytics.svc.cluster.local
+#   That name is stable across restarts and reschedules, and it is what each pod advertises as
+#   `app.streams.application-server`.
+#
+# publishNotReadyAddresses: true is REQUIRED here, not an optimisation.
+#   The readiness gate for a pod is "Kafka Streams is RUNNING". A pod that is REBALANCING or
+#   restoring state is NOT ready — but its peers still need to resolve its DNS name, because
+#   the address it published into the consumer-group metadata is exactly this name, and a peer
+#   that cannot resolve it reports the pod as a fan-out FAILURE instead of a transient. With
+#   the default (false), every rolling restart would make the surviving pods return
+#   `partial: true` for the entire restart window. The client-facing Service (21-service.yaml)
+#   keeps the strict readiness behaviour; only this peer-discovery Service relaxes it.
+# ---------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-streams-headless
+  namespace: kafka-analytics
+  labels:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+      protocol: TCP

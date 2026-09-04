@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------
+# PodDisruptionBudget — bounds VOLUNTARY disruption (node drains, cluster upgrades,
+# `kubectl drain`, autoscaler consolidation). It does not and cannot protect against
+# involuntary disruption such as a node crash.
+#
+# WHY IT MATTERS MORE HERE THAN FOR A STATELESS SERVICE:
+#   Losing an instance is not just "one less replica". Its partitions have to be reassigned,
+#   which triggers a group rebalance across ALL surviving instances, and the instance that
+#   picks up an orphaned partition has to restore that partition's state from the changelog
+#   before it can serve it. A node-pool upgrade that drains two nodes at once would take out
+#   both instances simultaneously — the application would be entirely unqueryable, and the
+#   pods that come back would restore from scratch on fresh nodes.
+#
+#   maxUnavailable: 1 forces the drain to be serialised: evict one, wait for it to come back
+#   READY (which, per the readiness probe, means Kafka Streams reached RUNNING again), then
+#   evict the next.
+#
+# maxUnavailable rather than minAvailable because it stays correct as the HPA changes the
+# replica count. `minAvailable: 1` would permit taking 2 of 3 pods down at once after a
+# scale-up; `maxUnavailable: 1` means "one at a time" at every size.
+#
+# CAVEAT: with replicas: 2, this budget makes a drain of the node hosting the last remaining
+# pod block indefinitely until the other pod is READY. That is the intent, but it means a
+# cluster upgrade will wait on state restore. If a drain appears stuck, check
+# `kubectl get pdb -n kafka-analytics` — ALLOWED DISRUPTIONS 0 is the PDB doing its job, not
+# a fault.
+# ---------------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ecommerce-streams
+  namespace: kafka-analytics
+  labels:
+    app.kubernetes.io/name: ecommerce-streams
+    app.kubernetes.io/component: streams-app
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ecommerce-streams
+      app.kubernetes.io/component: streams-app

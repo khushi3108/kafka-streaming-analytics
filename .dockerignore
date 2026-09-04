@@ -1,0 +1,63 @@
+# =====================================================================
+#  Build context exclusions.
+#
+#  The build stage needs exactly: gradlew, gradlew.bat, gradle/, settings.gradle.kts,
+#  build.gradle.kts, gradle.properties and src/. Everything else is either large
+#  (.git, build/, .gradle/ — hundreds of MB), machine-local, or would invalidate the
+#  Docker layer cache on every unrelated edit (docs/, README.md).
+# =====================================================================
+
+# ─── VCS ─────────────────────────────────────────────────────────────
+.git
+.gitignore
+.github
+
+# ─── Gradle build output and local caches ────────────────────────────
+# build/ in particular holds the ~98 MB fat jar from a host build; shipping it into the
+# context would both slow the build and risk COPY picking up a stale artifact.
+build
+.gradle
+gradle-app.setting
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# ─── Documentation and non-build assets ──────────────────────────────
+docs
+README.md
+*.md
+!src/**/*.md
+
+# ─── Infrastructure that is consumed OUTSIDE the image build ─────────
+k8s
+monitoring
+ksql
+scripts
+docker
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
+.dockerignore
+
+# ─── IDE / editor ────────────────────────────────────────────────────
+.idea
+.vscode
+*.iml
+*.ipr
+*.iws
+.settings
+.classpath
+.project
+
+# ─── OS noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Local runtime state and secrets ─────────────────────────────────
+tmp
+kafka-streams-state
+*.log
+*.env
+.env
+.env.*
+*.pem
+*.key
